@@ -29,7 +29,11 @@ class Server:
             task = yield self.queue.get()
             cpu_demand, net_in_demand, net_out_demand, duration = task
 
-            if cpu_demand + self.cpu_used > CPU_CAPACITY:
+            if ( 
+                cpu_demand + self.cpu_used > CPU_CAPACITY or
+                net_in_demand + self.net_in > NET_CAPACITY or
+                net_out_demand + self.net_out > NET_CAPACITY
+            ):
                 yield self.queue.put(task)
                 yield self.env.timeout(1)
                 continue
