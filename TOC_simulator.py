@@ -7,7 +7,6 @@ CPU_CAPACITY = 100
 NET_CAPACITY = 100
 TASK_INTERVAL = 1
 NUM_SERVERS = 3
-MAX_QUEUE_LEN = 5
 SIM_TIME = 500
 SLA_VIOLATIONS = 0
 TOTAL_TASKS = 0
@@ -61,7 +60,7 @@ class Server:
             COMPLETED_TASKS += 1
             TASK_TIMES[task_id]['completion'] = self.env.now
 
-def process_task(servers, rr_index):
+def process_task( servers, rr_index ):
     global TOTAL_TASKS, SLA_VIOLATIONS, TASK_ID, TASK_TIMES
 
     cpu_demand = random.randint(40, 90)
@@ -72,18 +71,30 @@ def process_task(servers, rr_index):
     TASK_ID += 1
     task_id = TASK_ID
     arrival_time = servers[0].env.now
-    TASK_TIMES[task_id] = {'arrival': arrival_time}
+    TASK_TIMES[task_id] = { 'arrival' : arrival_time }
 
-    server = servers[rr_index[0] % len(servers)]
-    rr_index[0] += 1
+    attempts = 0
 
-    if len(server.queue.items) >= MAX_QUEUE_LEN:
-        SLA_VIOLATIONS += 1
-        print(f"Task {task_id} dropped at time {arrival_time} — queue full at {server.name}")
-    else:
-        server.queue.put((cpu_demand, net_in_demand, net_out_demand, duration, task_id))
+    while attempts < NUM_SERVERS:
+        server = servers[rr_index[0] % len(servers)]
+        rr_index[0] += 1
 
-    TOTAL_TASKS += 1
+        bottleneck = (
+            server.cpu_used >= server.cpu_capacity * 0.8 or
+            server.net_in >= server.net_capacity * 0.8 or
+            server.net_out >= server.net_capacity * 0.8
+        )
+
+        if not bottleneck:
+            server.queue.put((cpu_demand, net_in_demand, net_out_demand, duration, task_id))
+            TOTAL_TASKS += 1
+            return
+        
+        attempts += 1
+    
+    SLA_VIOLATIONS += 1
+    TOTAL_TASKS +=1
+    print( f"Task {task_id} dropped at time {arrival_time}" )
 
 def generate_task( env, servers ):
     rr_index = [0]

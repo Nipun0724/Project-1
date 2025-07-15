@@ -7,7 +7,7 @@ WINDOW_SIZE = 20
 
 df = pd.read_csv('resource_usage_log.csv')
 
-df['bottleneck'] = (df['cpu_used'] / CPU_CAPACITY >= 0.5).astype(int)
+df['bottleneck'] = (df['cpu_used'] / CPU_CAPACITY >= 0.8).astype(int)
 
 features = ['cpu_used', 'q_len', 'network_in', 'network_out']
 scaler = MinMaxScaler()
