@@ -118,7 +118,7 @@ def simulation():
     env.run(until=SIM_TIME)
 
     df = pd.DataFrame(log_data)
-    df.to_csv("resource_usage_log.csv", index=False)
+    df.to_csv("resource_usage_log_no_toc.csv", index=False)
     print(df.head())
 
     sla_violation_rate = (SLA_VIOLATIONS / TOTAL_TASKS) * 100 if TOTAL_TASKS else 0

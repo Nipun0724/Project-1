@@ -5,9 +5,13 @@ from sklearn.preprocessing import MinMaxScaler
 CPU_CAPACITY = 100
 WINDOW_SIZE = 20
 
-df = pd.read_csv('resource_usage_log.csv')
+df = pd.read_csv('resource_usage_log_no_toc.csv')
 
-df['bottleneck'] = (df['cpu_used'] / CPU_CAPACITY >= 0.8).astype(int)
+df['bottleneck'] = (
+    (df['cpu_used'] >= 0.8) |
+    (df['network_in'] >= 0.8) |
+    (df['network_out'] >= 0.8)
+).astype(int)
 
 features = ['cpu_used', 'q_len', 'network_in', 'network_out']
 scaler = MinMaxScaler()
