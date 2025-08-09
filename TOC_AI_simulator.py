@@ -3,7 +3,10 @@ import random
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import defaultdict
+from collections import defaultdict, deque
+import joblib
+from tensorflow import keras
+from keras.models import load_model
 
 # --- Global Configuration ---
 TARGET_COMPLETED_TASKS = 500
@@ -18,6 +21,7 @@ if CONFIG == "BALANCED":
     CPU_CAPACITY = 100
     NET_CAPACITY = 100
     NUM_SERVERS = 6
+    WINDOW_SIZE = 20
     MAX_QUEUE_LEN = 8
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10 # Tasks will have priorities from 1 to this value (lower is higher priority)
@@ -34,6 +38,7 @@ elif CONFIG == "HIGH_CAPACITY":
     CPU_CAPACITY = 150
     NET_CAPACITY = 150
     NUM_SERVERS = 8
+    WINDOW_SIZE = 20
     MAX_QUEUE_LEN = 5
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10
@@ -50,6 +55,7 @@ elif CONFIG == "LIGHT_TASKS":
     CPU_CAPACITY = 100
     NET_CAPACITY = 100
     NUM_SERVERS = 4
+    WINDOW_SIZE = 20
     MAX_QUEUE_LEN = 6
     USE_LIGHTER_TASKS = True
     TASK_PRIORITY_RANGE = 10
@@ -66,6 +72,7 @@ elif CONFIG == "SCALABLE_BALANCED":
     CPU_CAPACITY = 100
     NET_CAPACITY = 100
     NUM_SERVERS = 3 # Starting number of servers
+    WINDOW_SIZE = 20
     MAX_QUEUE_LEN = 8
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10
@@ -106,6 +113,9 @@ class Server:
         # Using a list as a custom priority queue (lower priority number = higher priority)
         # Task format in queue_items: (cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority)
         self.queue_items = []
+
+        # For ML prediction
+        self.history_buffer = deque(maxlen=WINDOW_SIZE)
         self.env.process(self.run())
 
     @property
@@ -174,32 +184,63 @@ class Server:
         COMPLETED_TASKS += 1
         TASK_TIMES[task_id]['completion'] = self.env.now
 
-# --- Helper Function for Server Fitness Calculation ---
-def calculate_server_fitness(server, task_cpu_demand, task_net_in_demand, task_net_out_demand):
-    """
-    Calculates a fitness score for a server based on its current load and the task's demands.
-    Lower score means a better fit.
-    """
-    # Avoid division by zero if capacity is 0 (shouldn't happen with current setup)
-    cpu_util = server.cpu_used / server.cpu_capacity if server.cpu_capacity > 0 else 1
-    net_util = (server.net_in + server.net_out) / (2 * server.net_capacity) if server.net_capacity > 0 else 1
-    q_util = server.q_len / MAX_QUEUE_LEN if MAX_QUEUE_LEN > 0 else 1
+# --- Load Balancer / Server Selection ---
+# Load the pre-trained scaler
+try:
+    scaler = joblib.load('minmax_scaler.save')
+except FileNotFoundError:
+    print("Error: 'minmax_scaler.save' not found. Please ensure the scaler file is in the correct directory.")
+    exit()
 
-    # Check if the task can actually fit (a server with no capacity left is a bad fit)
-    if (server.cpu_used + task_cpu_demand > server.cpu_capacity or
-        server.net_in + task_net_in_demand > server.net_capacity or
-        server.net_out + task_net_out_demand > server.net_capacity):
-        return float('inf') # Return a very high score if task cannot fit
 
-    # Weighted sum of utilization metrics
-    fitness = (q_util * LOAD_BALANCING_WEIGHTS['q_len'] +
-               cpu_util * LOAD_BALANCING_WEIGHTS['cpu'] +
-               net_util * LOAD_BALANCING_WEIGHTS['net'])
-    return fitness
+def choose_server(servers, model):
+    """
+    Chooses the best server based on ML predictions.
+    Falls back to simple load balancing if not enough data is available.
+    """
+    input_data = []
+    candidate_servers = []
+
+    # Filter for servers that have a full history buffer for prediction
+    for server in servers:
+        if len(server.history_buffer) == WINDOW_SIZE:
+            raw_data = np.array(server.history_buffer).astype(np.float32)
+            normalized = scaler.transform(raw_data)
+            input_data.append(normalized)
+            candidate_servers.append(server)
+
+    # If no servers have enough history, use simple load balancing as a fallback
+    if not input_data:
+        # Find server with shortest queue that's not full
+        available_servers = [s for s in servers if s.q_len < MAX_QUEUE_LEN]
+        if available_servers:
+            return min(available_servers, key=lambda s: (s.q_len, s.cpu_used))
+        else:
+            # All queues are full, return the one with the shortest queue anyway
+            return min(servers, key=lambda s: s.q_len)
+
+    # Use the model to predict bottleneck scores
+    input_tensor = np.array(input_data)
+    preds = model.predict(input_tensor, verbose=0).flatten()
+
+    # Pair predictions with servers and sort by the lowest predicted bottleneck score
+    sorted_candidates = sorted(zip(preds, candidate_servers), key=lambda x: x[0])
+
+    # Choose the best-predicted server that has queue space
+    for pred_score, server in sorted_candidates:
+        if server.q_len < MAX_QUEUE_LEN:
+            return server
+
+    # If all candidate servers have full queues, return the one with the best score (and shortest queue as tie-breaker)
+    return min(candidate_servers, key=lambda s: s.q_len)
+
 
 # --- Task Processing and Generation Functions ---
-def process_incoming_task(env, servers):
-    """Generates a new task and dispatches it to the most suitable server."""
+def process_incoming_task(env, servers, model):
+    """
+    Generates a new task and dispatches it to the most suitable server using AI prediction.
+    This is the UPDATED function.
+    """
     global TOTAL_TASKS, SLA_VIOLATIONS, TASK_ID, TASK_TIMES
 
     # Determine task demands based on configuration
@@ -217,68 +258,70 @@ def process_incoming_task(env, servers):
     TASK_ID += 1
     task_id = TASK_ID
     arrival_time = env.now
-    priority = random.randint(1, TASK_PRIORITY_RANGE) # Assign a random priority
+    priority = random.randint(1, TASK_PRIORITY_RANGE)
 
     TASK_TIMES[task_id] = {'arrival': arrival_time, 'priority': priority}
 
-    # Filter for active servers and those not yet at max queue length
+    # --- CORRECTED LOGIC ---
+    # Always use the AI model to choose the best server from the list of active ones.
     active_servers = [s for s in servers if s.is_active]
-    available_servers_for_queue = [s for s in active_servers if s.q_len < MAX_QUEUE_LEN]
-
-    selected_server = None
-    if available_servers_for_queue:
-        # Select server based on calculated fitness
-        selected_server = min(available_servers_for_queue,
-                              key=lambda s: calculate_server_fitness(s, cpu_demand, net_in_demand, net_out_demand))
-    elif active_servers:
-        # If all available servers have full queues, pick the one with the shortest queue
-        # for potential rejection or to still try to put it there if MAX_QUEUE_LEN is just a soft limit
-        # For this simulation, we'll still reject if queue is full.
-        selected_server = min(active_servers, key=lambda s: s.q_len)
-    else:
-        # No active servers, task is rejected
+    if not active_servers:
+        # No active servers, task is rejected immediately
         print(f"Task {task_id} rejected - No active servers available at {env.now:.2f}")
         SLA_VIOLATIONS += 1
         TOTAL_TASKS += 1
         return
 
+    selected_server = choose_server(active_servers, model)
+    # --- END OF CORRECTION ---
 
     if selected_server.q_len >= MAX_QUEUE_LEN:
         SLA_VIOLATIONS += 1
         SLA_VIOLATIONS_PER_SERVER[selected_server.name] += 1
-        # Print rejection message less frequently to avoid spamming console
-        if task_id % 50 == 0 or TOTAL_TASKS < 10: # Print early tasks or every 50th
+        if task_id % 50 == 0 or TOTAL_TASKS < 10:
             print(f"[{env.now:.2f}] Task {task_id} (P:{priority}) rejected - Server {selected_server.name} queue full ({selected_server.q_len}/{MAX_QUEUE_LEN})")
     else:
-        # Add task to the selected server's queue
         selected_server.queue_items.append((cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority))
-        # print(f"[{env.now:.2f}] Task {task_id} (P:{priority}) arrived at {selected_server.name}, Q:{selected_server.q_len}")
 
     TOTAL_TASKS += 1
 
-def generate_task(env, servers):
+
+def generate_task(env, servers, model):
     """Process that continuously generates tasks."""
     while True:
         yield env.timeout(random.expovariate(1.0 / TASK_INTERVAL))
-        process_incoming_task(env, servers)
+        process_incoming_task(env, servers, model)
+
 
 # --- Monitoring and Logging Functions ---
 def periodic_logger(env, servers, log_data, interval=1):
     """Logs server and system metrics at regular intervals."""
     while True:
         yield env.timeout(interval)
+        # Log data for history buffer used by the ML model
+        for server in servers:
+            if server.is_active:
+                 server.history_buffer.append([
+                    server.q_len,
+                    server.cpu_used,
+                    server.net_in,
+                    server.net_out
+                ])
+
+        # Log detailed data for post-simulation analysis
         for server in servers:
             log_data.append({
-                'timestamp'  : env.now,
-                'server_id'  : server.name,
-                'is_active'  : server.is_active,
-                'cpu_used'   : server.cpu_used,
-                'q_len'      : server.q_len,
-                'network_in' : server.net_in,
-                'network_out': server.net_out,
+                'timestamp'   : env.now,
+                'server_id'   : server.name,
+                'is_active'   : server.is_active,
+                'cpu_used'    : server.cpu_used,
+                'q_len'       : server.q_len,
+                'network_in'  : server.net_in,
+                'network_out' : server.net_out,
                 'current_tasks': server.current_tasks
             })
-        # Log active servers count
+        
+        # Log active servers count for scaling analysis
         ACTIVE_SERVERS_HISTORY.append({
             'timestamp': env.now,
             'active_servers_count': sum(1 for s in servers if s.is_active)
@@ -287,14 +330,13 @@ def periodic_logger(env, servers, log_data, interval=1):
 
 def monitor_system(env, servers):
     """Monitors system load and scales servers up or down."""
-    global NUM_SERVERS # This will be the current number of active servers
+    global NUM_SERVERS
 
     while True:
         yield env.timeout(SCALING_CHECK_INTERVAL)
 
         active_servers = [s for s in servers if s.is_active]
         if not active_servers:
-            # If no active servers, and we are below MIN_NUM_SERVERS, activate one
             if NUM_SERVERS < MIN_NUM_SERVERS and len(servers) > NUM_SERVERS:
                 servers[NUM_SERVERS].is_active = True
                 NUM_SERVERS += 1
@@ -306,50 +348,42 @@ def monitor_system(env, servers):
 
         # Scale Up Logic
         if avg_q_utilization > SCALE_UP_THRESHOLD and NUM_SERVERS < MAX_NUM_SERVERS:
-            # Find an inactive server to activate
             inactive_servers = [s for s in servers if not s.is_active]
             if inactive_servers:
-                server_to_activate = inactive_servers[0] # Just pick the first available
+                server_to_activate = inactive_servers[0]
                 server_to_activate.is_active = True
                 NUM_SERVERS += 1
                 print(f"[{env.now:.2f}] Scaling up: Activated {server_to_activate.name}. Total active: {NUM_SERVERS}")
-            else:
-                # This case means we hit MAX_NUM_SERVERS but the list 'servers' itself is not large enough
-                # In a real system, you'd provision more servers. For this simulation, we're capped.
-                pass # No more servers to activate
 
         # Scale Down Logic
         elif avg_q_utilization < SCALE_DOWN_THRESHOLD and NUM_SERVERS > MIN_NUM_SERVERS:
-            # Find an active server that is idle or has very few tasks/queue
-            # Prioritize servers with no current tasks and empty queues
             eligible_for_shutdown = [s for s in active_servers if s.current_tasks == 0 and s.q_len == 0]
             if eligible_for_shutdown:
-                server_to_deactivate = eligible_for_shutdown[0] # Pick one to deactivate
+                server_to_deactivate = eligible_for_shutdown[0]
                 server_to_deactivate.is_active = False
                 NUM_SERVERS -= 1
                 print(f"[{env.now:.2f}] Scaling down: Deactivated {server_to_deactivate.name}. Total active: {NUM_SERVERS}")
-            # If no idle server, don't scale down prematurely, wait for them to finish tasks.
+
 
 # --- Main Simulation Function ---
 def simulation():
     global SLA_VIOLATIONS, TOTAL_TASKS, COMPLETED_TASKS, TASK_ID, TASK_TIMES, SLA_VIOLATIONS_PER_SERVER, ACTIVE_SERVERS_HISTORY, NUM_SERVERS
 
+    try:
+        model = load_model("bottleneck_predictor.keras")
+    except (IOError, ImportError) as e:
+        print(f"Error loading Keras model 'bottleneck_predictor.keras': {e}")
+        print("Please ensure the model file is present and you have TensorFlow/Keras installed.")
+        return
+
     print("Starting simulation...")
     print(f"Configuration: {CONFIG}")
     print(f"Initial Servers: {NUM_SERVERS}, Task Interval: {TASK_INTERVAL}, Max Queue: {MAX_QUEUE_LEN}")
     print(f"Server Capacity: CPU={CPU_CAPACITY}, NET={NET_CAPACITY}")
-    print(f"Lighter Tasks: {USE_LIGHTER_TASKS}")
-    print(f"Task Priority Range: 1 (highest) to {TASK_PRIORITY_RANGE} (lowest)")
-    print(f"Load Balancing Weights: Queue={LOAD_BALANCING_WEIGHTS['q_len']}, CPU={LOAD_BALANCING_WEIGHTS['cpu']}, Net={LOAD_BALANCING_WEIGHTS['net']}")
     if MAX_NUM_SERVERS > MIN_NUM_SERVERS:
         print(f"Dynamic Scaling: Min Servers={MIN_NUM_SERVERS}, Max Servers={MAX_NUM_SERVERS}")
-        print(f"Scale Up Threshold (Avg Q Util): {SCALE_UP_THRESHOLD*100:.0f}%")
-        print(f"Scale Down Threshold (Avg Q Util): {SCALE_DOWN_THRESHOLD*100:.0f}%")
-        print(f"Scaling Check Interval: {SCALING_CHECK_INTERVAL} time units")
     else:
         print("Dynamic Scaling: Disabled (Fixed number of servers)")
-
-    print(f"Target: ~{TARGET_COMPLETED_TASKS} completed tasks in {SIM_TIME} time units")
     print("="*60)
 
     # Reset global metrics for a new simulation run
@@ -360,48 +394,48 @@ def simulation():
     TASK_TIMES = {}
     SLA_VIOLATIONS_PER_SERVER.clear()
     ACTIVE_SERVERS_HISTORY = []
+    
     # Reset NUM_SERVERS to its initial value for the chosen CONFIG
-    if CONFIG == "SCALABLE_BALANCED":
-        NUM_SERVERS = 3 # Starting value for scalable config
-    else:
-        NUM_SERVERS = 6 if CONFIG == "BALANCED" else (8 if CONFIG == "HIGH_CAPACITY" else 4)
+    initial_num_servers = {
+        "BALANCED": 6,
+        "HIGH_CAPACITY": 8,
+        "LIGHT_TASKS": 4,
+        "SCALABLE_BALANCED": 3
+    }.get(CONFIG, 3)
+    NUM_SERVERS = initial_num_servers
 
-
-    random.seed(RANDOM_SEED) # Ensure reproducibility for each run
+    random.seed(RANDOM_SEED)
     env = simpy.Environment()
 
-    # Create all possible servers up to MAX_NUM_SERVERS, but only activate initial NUM_SERVERS
     all_servers = [Server(env, f"Server {i+1}") for i in range(MAX_NUM_SERVERS)]
-    for i in range(NUM_SERVERS): # Activate initial set of servers
+    for i in range(NUM_SERVERS):
         all_servers[i].is_active = True
-    for i in range(NUM_SERVERS, MAX_NUM_SERVERS): # Deactivate the rest initially
+    for i in range(NUM_SERVERS, MAX_NUM_SERVERS):
         all_servers[i].is_active = False
 
-    log_data = [] # Data for server metrics logging
+    log_data = []
     
-    # Start simulation processes
-    env.process(generate_task(env, all_servers))
+    env.process(generate_task(env, all_servers, model))
     env.process(periodic_logger(env, all_servers, log_data))
-    if MAX_NUM_SERVERS > MIN_NUM_SERVERS: # Only start monitor if scaling is enabled
+    if MAX_NUM_SERVERS > MIN_NUM_SERVERS:
         env.process(monitor_system(env, all_servers))
 
-    # Run the simulation
     env.run(until=SIM_TIME)
 
-    # --- Post-simulation Analysis and Results ---
+    # --- Post-simulation Analysis and Results (Expanded Version) ---
     df_server_logs = pd.DataFrame(log_data)
-    df_server_logs.to_csv("resource_usage_log_enhanced.csv", index=False)
-
+    df_server_logs.to_csv("resource_usage_log_ai_toc.csv", index=False) # Changed filename for clarity
     df_active_servers = pd.DataFrame(ACTIVE_SERVERS_HISTORY)
 
     sla_rate = (SLA_VIOLATIONS / TOTAL_TASKS) * 100 if TOTAL_TASKS else 0
     completion_rate_of_target = (COMPLETED_TASKS / TARGET_COMPLETED_TASKS) * 100
-    
-    # Calculate average queue length only for active servers
+
+    # Calculate average metrics only for active servers
     if not df_server_logs.empty:
         active_server_logs = df_server_logs[df_server_logs['is_active'] == True]
         avg_q_len = active_server_logs['q_len'].mean() if not active_server_logs.empty else 0
         avg_cpu_util = (active_server_logs['cpu_used'] / CPU_CAPACITY).mean() * 100 if not active_server_logs.empty else 0
+        # Add the missing network utilization calculation
         avg_net_util = ((active_server_logs['network_in'] + active_server_logs['network_out']) / (2 * NET_CAPACITY)).mean() * 100 if not active_server_logs.empty else 0
     else:
         avg_q_len = 0
@@ -413,7 +447,7 @@ def simulation():
     ]
     avg_turnaround = np.mean(turnaround_times) if turnaround_times else 0
 
-    print(f"\n=== SIMULATION RESULTS ===")
+    print(f"\n=== SIMULATION RESULTS (AI + TOC) ===")
     print(f"Configuration Used: {CONFIG}")
     print(f"Target Completed Tasks: {TARGET_COMPLETED_TASKS}")
     print(f"Actual Completed Tasks: {COMPLETED_TASKS} ({completion_rate_of_target:.1f}% of target)")
@@ -426,6 +460,7 @@ def simulation():
     print(f"Average Turnaround Time: {avg_turnaround:.2f}")
     print(f"System Task Completion Rate: {(COMPLETED_TASKS/TOTAL_TASKS)*100:.1f}% (Completed vs. Generated)")
 
+    # Add performance grade
     if completion_rate_of_target >= 95:
         print("✅ EXCELLENT: Target achieved!")
     elif completion_rate_of_target >= 80:
@@ -435,9 +470,10 @@ def simulation():
     else:
         print("❌ POOR: Significant underperformance")
 
+    # Add violations per server
     print(f"SLA Violations per Server: {dict(SLA_VIOLATIONS_PER_SERVER)}")
 
-    # --- Tuning Recommendations ---
+    # Add tuning recommendations
     if completion_rate_of_target < 90 or sla_rate > 5:
         print(f"\n=== TUNING RECOMMENDATIONS ===")
         if sla_rate > 5:
@@ -452,8 +488,8 @@ def simulation():
             print("- Low average queue length detected, and scaling is enabled.")
             print("  → Consider adjusting SCALE_DOWN_THRESHOLD higher or decreasing MIN_NUM_SERVERS.")
         elif avg_q_len < 0.5 and (MAX_NUM_SERVERS == MIN_NUM_SERVERS):
-             print("- Low average queue length detected, scaling is disabled.")
-             print("  → Consider reducing NUM_SERVERS or increasing TASK_INTERVAL.")
+            print("- Low average queue length detected, scaling is disabled.")
+            print("  → Consider reducing NUM_SERVERS or increasing TASK_INTERVAL.")
 
         if avg_turnaround > (SIM_TIME / 10): # Arbitrary threshold for high turnaround
             print("- High average turnaround time detected (tasks take long to complete).")
@@ -462,7 +498,7 @@ def simulation():
                 print("  → Ensure SCALE_UP_THRESHOLD is not too high, preventing timely scaling.")
             else:
                 print("  → Increase NUM_SERVERS.")
-
+    
     # --- Plotting Results ---
     if not df_server_logs.empty:
         plt.figure(figsize=(18, 12))
@@ -471,7 +507,7 @@ def simulation():
         plt.subplot(3, 2, 1)
         for server_id in df_server_logs['server_id'].unique():
             server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-            plt.plot(server_data['timestamp'], server_data['q_len'], label=f'{server_id} (Active: {server_data["is_active"].iloc[-1]})', alpha=0.7)
+            plt.plot(server_data['timestamp'], server_data['q_len'], label=f'{server_id}', alpha=0.7)
         plt.title('Queue Length Over Time per Server')
         plt.xlabel('Time')
         plt.ylabel('Queue Length')
@@ -482,24 +518,23 @@ def simulation():
         plt.subplot(3, 2, 2)
         for server_id in df_server_logs['server_id'].unique():
             server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-            plt.plot(server_data['timestamp'], server_data['cpu_used'], label=f'{server_id} (Active: {server_data["is_active"].iloc[-1]})', alpha=0.7)
+            plt.plot(server_data['timestamp'], server_data['cpu_used'], label=f'{server_id}', alpha=0.7)
         plt.title('CPU Usage Over Time per Server')
         plt.xlabel('Time')
         plt.ylabel('CPU Used')
         plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
         plt.grid(True)
 
-        # Plot 3: Network Usage Over Time
+        # Plot 3: Active Servers Over Time
         plt.subplot(3, 2, 3)
-        for server_id in df_server_logs['server_id'].unique():
-            server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-            plt.plot(server_data['timestamp'], server_data['network_in'], label=f'{server_id} In', linestyle='-', alpha=0.7)
-            plt.plot(server_data['timestamp'], server_data['network_out'], label=f'{server_id} Out', linestyle='--', alpha=0.7)
-        plt.title('Network Usage Over Time per Server')
-        plt.xlabel('Time')
-        plt.ylabel('Network Usage')
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-        plt.grid(True)
+        if not df_active_servers.empty:
+            plt.plot(df_active_servers['timestamp'], df_active_servers['active_servers_count'], marker='o', linestyle='-', color='purple')
+            plt.title('Number of Active Servers Over Time')
+            plt.xlabel('Time')
+            plt.ylabel('Active Servers')
+            plt.grid(True)
+            if MAX_NUM_SERVERS > MIN_NUM_SERVERS:
+                plt.yticks(range(MIN_NUM_SERVERS, MAX_NUM_SERVERS + 2))
 
         # Plot 4: Task Completion Time Distribution
         plt.subplot(3, 2, 4)
@@ -509,54 +544,24 @@ def simulation():
             plt.xlabel('Turnaround Time')
             plt.ylabel('Frequency')
             plt.grid(True)
-        else:
-            plt.text(0.5, 0.5, 'No tasks completed to plot turnaround time.', horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
-
-
-        # Plot 5: Active Servers Over Time
+        
+        # Plot 5: Overall System CPU Utilization
         plt.subplot(3, 2, 5)
         if not df_active_servers.empty:
-            plt.plot(df_active_servers['timestamp'], df_active_servers['active_servers_count'], marker='o', linestyle='-', color='purple')
-            plt.title('Number of Active Servers Over Time')
-            plt.xlabel('Time')
-            plt.ylabel('Active Servers')
-            plt.grid(True)
-            plt.yticks(range(MIN_NUM_SERVERS, MAX_NUM_SERVERS + 1)) # Ensure integer ticks
-        else:
-            plt.text(0.5, 0.5, 'No active server history to plot.', horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
-
-        # Plot 6: Overall System Utilization (CPU & Network)
-        plt.subplot(3, 2, 6)
-        if not active_server_logs.empty:
-            # Calculate total CPU/Net capacity of active servers at each timestamp
-            df_merged = df_server_logs.merge(df_active_servers, on='timestamp', how='left')
+            df_merged = df_server_logs.merge(df_active_servers, on='timestamp', how='left').ffill()
             df_merged['total_cpu_capacity'] = df_merged['active_servers_count'] * CPU_CAPACITY
-            df_merged['total_net_capacity'] = df_merged['active_servers_count'] * NET_CAPACITY * 2 # In + Out
-
-            # Sum used resources across active servers
-            df_summed_usage = df_server_logs[df_server_logs['is_active'] == True].groupby('timestamp').agg(
-                total_cpu_used=('cpu_used', 'sum'),
-                total_net_used=('network_in', lambda x: x.sum() + df_server_logs.loc[x.index, 'network_out'].sum())
-            ).reset_index()
-
-            df_util = df_summed_usage.merge(df_merged[['timestamp', 'total_cpu_capacity', 'total_net_capacity']].drop_duplicates(), on='timestamp', how='left')
-
+            df_summed_usage = df_server_logs[df_server_logs['is_active']].groupby('timestamp').agg(total_cpu_used=('cpu_used', 'sum')).reset_index()
+            df_util = df_summed_usage.merge(df_merged[['timestamp', 'total_cpu_capacity']].drop_duplicates(), on='timestamp', how='left')
             df_util['overall_cpu_util'] = (df_util['total_cpu_used'] / df_util['total_cpu_capacity']) * 100
-            df_util['overall_net_util'] = (df_util['total_net_used'] / df_util['total_net_capacity']) * 100
-            
             plt.plot(df_util['timestamp'], df_util['overall_cpu_util'], label='Overall CPU Utilization', color='red')
-            plt.plot(df_util['timestamp'], df_util['overall_net_util'], label='Overall Network Utilization', color='blue', linestyle='--')
-            plt.title('Overall System Utilization')
+            plt.title('Overall System CPU Utilization')
             plt.xlabel('Time')
             plt.ylabel('Utilization (%)')
             plt.ylim(0, 100)
             plt.legend()
             plt.grid(True)
-        else:
-            plt.text(0.5, 0.5, 'Not enough data to plot overall utilization.', horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
 
-
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.suptitle(f'Simulation Results for {CONFIG} Configuration', fontsize=16, y=0.98)
         plt.show()
 
