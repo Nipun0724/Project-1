@@ -15,7 +15,7 @@ TASK_INTERVAL = 1.0 # Average time between task arrivals (exponential distributi
 WINDOW_SIZE = 20 # <<< AI ADDITION: Needed for the prediction model
 
 # Configuration Profiles
-CONFIG = "BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS"
+CONFIG = "LIGHT_TASKS" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS"
 
 if CONFIG == "BALANCED":
     RANDOM_SEED = 42
@@ -318,26 +318,53 @@ def simulation():
     if not df_server_logs.empty:
         plt.figure(figsize=(18, 8))
 
-        # Plot 1: Queue Length
+        # Plot 1: Queue Length Over Time
         plt.subplot(2, 2, 1)
         for server_id in df_server_logs['server_id'].unique():
             server_data = df_server_logs[df_server_logs['server_id'] == server_id]
             plt.plot(server_data['timestamp'], server_data['q_len'], label=f'{server_id}', alpha=0.7)
-        plt.title('Queue Length Over Time')
+        plt.title('Queue Length Over Time per Server')
+        plt.xlabel('Time')
+        plt.ylabel('Queue Length')
         plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
         plt.grid(True)
 
-        # Plot 2: CPU Usage
+        # Plot 2: CPU Usage Over Time
         plt.subplot(2, 2, 2)
         for server_id in df_server_logs['server_id'].unique():
             server_data = df_server_logs[df_server_logs['server_id'] == server_id]
             plt.plot(server_data['timestamp'], server_data['cpu_used'], label=f'{server_id}', alpha=0.7)
-        plt.title('CPU Usage Over Time')
+        plt.title('CPU Usage Over Time per Server')
+        plt.xlabel('Time')
+        plt.ylabel('CPU Used')
         plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
         plt.grid(True)
-        
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.suptitle(f'Simulation Results for {CONFIG} (AI-Driven Scheduler)', fontsize=16)
+
+        # Plot 3: Network Usage Over Time
+        plt.subplot(2, 2, 3)
+        for server_id in df_server_logs['server_id'].unique():
+            server_data = df_server_logs[df_server_logs['server_id'] == server_id]
+            plt.plot(server_data['timestamp'], server_data['network_in'], label=f'{server_id} In', linestyle='-', alpha=0.7)
+            plt.plot(server_data['timestamp'], server_data['network_out'], label=f'{server_id} Out', linestyle='--', alpha=0.7)
+        plt.title('Network Usage Over Time per Server')
+        plt.xlabel('Time')
+        plt.ylabel('Network Usage')
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.grid(True)
+
+        # Plot 4: Task Completion Time Distribution
+        plt.subplot(2, 2, 4)
+        if turnaround_times:
+            plt.hist(turnaround_times, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+            plt.title('Task Turnaround Time Distribution')
+            plt.xlabel('Turnaround Time')
+            plt.ylabel('Frequency')
+            plt.grid(True)
+        else:
+            plt.text(0.5, 0.5, 'No tasks completed to plot.', horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap
+        plt.suptitle(f'Simulation Results for {CONFIG} Configuration (Round Robin with AI, No Scaling)', fontsize=16, y=0.98)
         plt.show()
 
 if __name__ == '__main__':
