@@ -3,12 +3,16 @@ import random
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import defaultdict
 
 # --- Global Configuration ---
 TARGET_COMPLETED_TASKS = 500
 SIM_TIME = 500 # Simulation duration in time units
 TASK_INTERVAL = 1.0 # Average time between task arrivals (exponential distribution)
+
+# --- TOC: Configuration for the Constraint Detector ---
+# EWMA (Exponentially Weighted Moving Average) alpha for smoothing utilization metrics
+EWMA_ALPHA = 0.2 
+CONSTRAINT_CHECK_INTERVAL = 5 # How often to re-evaluate the system constraint
 
 # Configuration Profiles
 CONFIG = "SCALABLE_BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS", "SCALABLE_BALANCED"
@@ -19,6 +23,7 @@ if CONFIG == "BALANCED":
     NET_CAPACITY = 100
     NUM_SERVERS = 6
     MAX_QUEUE_LEN = 8
+    MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10 # Tasks will have priorities from 1 to this value (lower is higher priority)
     LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2} # Weights for server fitness calculation
@@ -35,6 +40,7 @@ elif CONFIG == "HIGH_CAPACITY":
     NET_CAPACITY = 150
     NUM_SERVERS = 8
     MAX_QUEUE_LEN = 5
+    MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10
     LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2}
@@ -51,6 +57,7 @@ elif CONFIG == "LIGHT_TASKS":
     NET_CAPACITY = 100
     NUM_SERVERS = 4
     MAX_QUEUE_LEN = 6
+    MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = True
     TASK_PRIORITY_RANGE = 10
     LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2}
@@ -66,16 +73,16 @@ elif CONFIG == "SCALABLE_BALANCED":
     CPU_CAPACITY = 100
     NET_CAPACITY = 100
     NUM_SERVERS = 3 # Starting number of servers
-    MAX_QUEUE_LEN = 8
+    MAX_QUEUE_LEN = 5
+    MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10
-    LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2}
     # Dynamic Scaling (enabled for SCALABLE_BALANCED profile)
     MIN_NUM_SERVERS = 2
     MAX_NUM_SERVERS = 10
-    SCALE_UP_THRESHOLD = 0.6 # If average queue utilization > 60%, scale up
-    SCALE_DOWN_THRESHOLD = 0.2 # If average queue utilization < 20%, scale down
-    SCALING_CHECK_INTERVAL = 10
+    SCALE_UP_THRESHOLD = 0.7 # If average queue utilization > 60%, scale up
+    SCALE_DOWN_THRESHOLD = 0.4 # If average queue utilization < 20%, scale down
+    SCALING_CHECK_INTERVAL = 15
 
 
 # --- Global Simulation Metrics (will be reset for each simulation run) ---
@@ -84,11 +91,100 @@ TOTAL_TASKS = 0
 COMPLETED_TASKS = 0
 TASK_ID = 0 # Global task counter
 TASK_TIMES = {} # Stores arrival and completion times for each task
-SLA_VIOLATIONS_PER_SERVER = defaultdict(int)
 ACTIVE_SERVERS_HISTORY = [] # To log the number of active servers over time
 
 # Set initial random seed for reproducibility
 random.seed(RANDOM_SEED)
+
+# --- TOC STEP 1: IDENTIFY ---
+class ConstraintDetector:
+    """Monitors all resources to identify the single system constraint."""
+    def __init__(self, env, all_servers):
+        self.env = env
+        self.all_servers = all_servers
+        self.current_constraint = {'name': 'None', 'util': 0.0}
+        # Initialize smoothed utilization for all potential resources
+        self.smoothed_utils = {
+            f"{s.name}_{res}": 0.0 
+            for s in all_servers 
+            for res in ['cpu', 'net']
+        }
+        self.env.process(self.run())
+
+    def run(self):
+        while True:
+            yield self.env.timeout(CONSTRAINT_CHECK_INTERVAL)
+            
+            max_util = -1.0
+            constraint_name = 'None'
+
+            active_servers = [s for s in self.all_servers if s.is_active]
+            for server in active_servers:
+                # Calculate current utilization
+                cpu_util = server.cpu_used / server.cpu_capacity
+                net_util = (server.net_in + server.net_out) / (2 * server.net_capacity)
+
+                # Update smoothed utilization using EWMA
+                self.smoothed_utils[f"{server.name}_cpu"] = (EWMA_ALPHA * cpu_util) + \
+                    (1 - EWMA_ALPHA) * self.smoothed_utils[f"{server.name}_cpu"]
+                
+                self.smoothed_utils[f"{server.name}_net"] = (EWMA_ALPHA * net_util) + \
+                    (1 - EWMA_ALPHA) * self.smoothed_utils[f"{server.name}_net"]
+
+                # Check if this resource is the new constraint
+                if self.smoothed_utils[f"{server.name}_cpu"] > max_util:
+                    max_util = self.smoothed_utils[f"{server.name}_cpu"]
+                    constraint_name = f"{server.name} CPU"
+                
+                if self.smoothed_utils[f"{server.name}_net"] > max_util:
+                    max_util = self.smoothed_utils[f"{server.name}_net"]
+                    constraint_name = f"{server.name} Network"
+
+            self.current_constraint['name'] = constraint_name
+            self.current_constraint['util'] = max_util
+
+# --- TOC STEPS 2 & 3: EXPLOIT & SUBORDINATE ---
+class Dispatcher:
+    """Acts as the gatekeeper (Rope) managing the central task buffer."""
+    def __init__(self, env, all_servers, constraint_detector):
+        self.env = env
+        self.all_servers = all_servers
+        self.constraint_detector = constraint_detector
+        self.task_buffer = [] # Central buffer for all incoming tasks
+        self.env.process(self.run())
+
+    def add_task(self, task):
+        self.task_buffer.append(task)
+        # Sort by priority
+        self.task_buffer.sort(key=lambda x: x[5])
+
+    def run(self):
+        while True:
+            if not self.task_buffer:
+                yield self.env.timeout(0.5) # Wait if no tasks
+                continue
+
+            # Find the server object that is the current constraint
+            constraint_name_parts = self.constraint_detector.current_constraint['name'].split(' ')
+            constraint_server_name = " ".join(constraint_name_parts[0:2]) if len(constraint_name_parts) > 1 else None
+            constraint_server = next((s for s in self.all_servers if s.name == constraint_server_name), None)
+            
+            # DBR Logic: The "Rope"
+            # Only release work if the constraint's buffer has space.
+            if constraint_server and constraint_server.q_len < MAX_QUEUE_LEN:
+                 # Find a server for the highest priority task
+                task_to_dispatch = self.task_buffer.pop(0)
+                
+                # Simple dispatch: find first available server
+                # A more advanced TOC model would subordinate even this choice
+                # to better protect the constraint.
+                available_servers = [s for s in self.all_servers if s.is_active and s.q_len < MAX_QUEUE_LEN]
+                if available_servers:
+                    # Dispatch to the least loaded available server
+                    best_server = min(available_servers, key=lambda s: s.q_len)
+                    best_server.add_to_buffer(task_to_dispatch)
+
+            yield self.env.timeout(0.2) # Check frequently
 
 # --- Server Class ---
 class Server:
@@ -107,7 +203,10 @@ class Server:
         # Task format in queue_items: (cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority)
         self.queue_items = []
         self.env.process(self.run())
-
+    
+    def add_to_buffer(self, task):
+        self.queue_items.append(task)
+    
     @property
     def q_len(self):
         """Return current queue length."""
@@ -115,28 +214,18 @@ class Server:
 
     def run(self):
         """Server's main process: continuously fetches and processes tasks."""
-        global COMPLETED_TASKS, TASK_TIMES, SLA_VIOLATIONS, SLA_VIOLATIONS_PER_SERVER
+        global COMPLETED_TASKS, TASK_TIMES
 
         while True:
             # If the server is not active, it should not process tasks
-            if not self.is_active:
-                yield self.env.timeout(1) # Wait if inactive
+            if not self.is_active or not self.queue_items:
+                yield self.env.timeout(0.5) # Wait if inactive
                 continue
-
-            # If queue is empty, wait for tasks
-            if not self.queue_items:
-                yield self.env.timeout(0.5)
-                continue
-
-            # Implement priority queue logic: sort by priority (lower is higher)
-            # and then by arrival time (to ensure FIFO among same priority tasks)
-            # Task format: (cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority)
-            self.queue_items.sort(key=lambda x: (x[5], TASK_TIMES[x[4]]['arrival']))
 
             # Try to find a task that can be processed with current resources
             task_to_process_index = -1
             for i, task in enumerate(self.queue_items):
-                cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority = task
+                cpu_demand, net_in_demand, net_out_demand, _, _, _ = task
                 if (cpu_demand + self.cpu_used <= self.cpu_capacity and
                     net_in_demand + self.net_in <= self.net_capacity and
                     net_out_demand + self.net_out <= self.net_capacity):
@@ -146,7 +235,7 @@ class Server:
             if task_to_process_index != -1:
                 # Resources are available for the selected task, accept and start processing
                 task = self.queue_items.pop(task_to_process_index)
-                cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority = task
+                cpu_demand, net_in_demand, net_out_demand, duration, task_id, _ = task
 
                 self.cpu_used += cpu_demand
                 self.net_in += net_in_demand
@@ -174,173 +263,99 @@ class Server:
         COMPLETED_TASKS += 1
         TASK_TIMES[task_id]['completion'] = self.env.now
 
-# --- Helper Function for Server Fitness Calculation ---
-def calculate_server_fitness(server, task_cpu_demand, task_net_in_demand, task_net_out_demand):
-    """
-    Calculates a fitness score for a server based on its current load and the task's demands.
-    Lower score means a better fit.
-    """
-    # Avoid division by zero if capacity is 0 (shouldn't happen with current setup)
-    cpu_util = server.cpu_used / server.cpu_capacity if server.cpu_capacity > 0 else 1
-    net_util = (server.net_in + server.net_out) / (2 * server.net_capacity) if server.net_capacity > 0 else 1
-    q_util = server.q_len / MAX_QUEUE_LEN if MAX_QUEUE_LEN > 0 else 1
-
-    # Check if the task can actually fit (a server with no capacity left is a bad fit)
-    if (server.cpu_used + task_cpu_demand > server.cpu_capacity or
-        server.net_in + task_net_in_demand > server.net_capacity or
-        server.net_out + task_net_out_demand > server.net_capacity):
-        return float('inf') # Return a very high score if task cannot fit
-
-    # Weighted sum of utilization metrics
-    fitness = (q_util * LOAD_BALANCING_WEIGHTS['q_len'] +
-               cpu_util * LOAD_BALANCING_WEIGHTS['cpu'] +
-               net_util * LOAD_BALANCING_WEIGHTS['net'])
-    return fitness
-
 # --- Task Processing and Generation Functions ---
-def process_incoming_task(env, servers):
-    """Generates a new task and dispatches it to the most suitable server."""
-    global TOTAL_TASKS, SLA_VIOLATIONS, TASK_ID, TASK_TIMES
+def process_incoming_task(env, dispatcher):
+    """Generates a new task and passes it to the central dispatcher."""
+    global TOTAL_TASKS, TASK_ID, TASK_TIMES, SLA_VIOLATIONS
+    
+    # --- Check for SLA violation before creating the task ---
+    if len(dispatcher.task_buffer) >= MAX_CENTRAL_BUFFER_LEN:
+        SLA_VIOLATIONS += 1
+        TOTAL_TASKS += 1 # Still count it as an attempt
+        return
 
-    # Determine task demands based on configuration
+    # Task property generation
     if USE_LIGHTER_TASKS:
-        cpu_demand = random.randint(8, 25)
-        net_in_demand = random.randint(1, 8)
-        net_out_demand = random.randint(1, 8)
-        duration = random.randint(2, 8)
+        cpu_demand, net_in_demand, net_out_demand, duration = random.randint(8, 25), random.randint(1, 8), random.randint(1, 8), random.randint(2, 8)
     else:
-        cpu_demand = random.randint(40, 90)
-        net_in_demand = random.randint(5, 15)
-        net_out_demand = random.randint(5, 15)
-        duration = random.randint(5, 15)
+        cpu_demand, net_in_demand, net_out_demand, duration = random.randint(40, 90), random.randint(5, 15), random.randint(5, 15), random.randint(5, 15)
 
     TASK_ID += 1
     task_id = TASK_ID
     arrival_time = env.now
-    priority = random.randint(1, TASK_PRIORITY_RANGE) # Assign a random priority
-
+    priority = random.randint(1, TASK_PRIORITY_RANGE)
     TASK_TIMES[task_id] = {'arrival': arrival_time, 'priority': priority}
-
-    # Filter for active servers and those not yet at max queue length
-    active_servers = [s for s in servers if s.is_active]
-    available_servers_for_queue = [s for s in active_servers if s.q_len < MAX_QUEUE_LEN]
-
-    selected_server = None
-    if available_servers_for_queue:
-        # Select server based on calculated fitness
-        selected_server = min(available_servers_for_queue,
-                              key=lambda s: calculate_server_fitness(s, cpu_demand, net_in_demand, net_out_demand))
-    elif active_servers:
-        # If all available servers have full queues, pick the one with the shortest queue
-        # for potential rejection or to still try to put it there if MAX_QUEUE_LEN is just a soft limit
-        # For this simulation, we'll still reject if queue is full.
-        selected_server = min(active_servers, key=lambda s: s.q_len)
-    else:
-        # No active servers, task is rejected
-        print(f"Task {task_id} rejected - No active servers available at {env.now:.2f}")
-        SLA_VIOLATIONS += 1
-        TOTAL_TASKS += 1
-        return
-
-
-    if selected_server.q_len >= MAX_QUEUE_LEN:
-        SLA_VIOLATIONS += 1
-        SLA_VIOLATIONS_PER_SERVER[selected_server.name] += 1
-        # Print rejection message less frequently to avoid spamming console
-        if task_id % 50 == 0 or TOTAL_TASKS < 10: # Print early tasks or every 50th
-            print(f"[{env.now:.2f}] Task {task_id} (P:{priority}) rejected - Server {selected_server.name} queue full ({selected_server.q_len}/{MAX_QUEUE_LEN})")
-    else:
-        # Add task to the selected server's queue
-        selected_server.queue_items.append((cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority))
-        # print(f"[{env.now:.2f}] Task {task_id} (P:{priority}) arrived at {selected_server.name}, Q:{selected_server.q_len}")
-
+    
+    # Task is added to the dispatcher instead of a server
+    task = (cpu_demand, net_in_demand, net_out_demand, duration, task_id, priority)
+    dispatcher.add_task(task)
+    
     TOTAL_TASKS += 1
 
-def generate_task(env, servers):
-    """Process that continuously generates tasks."""
+def generate_task(env, dispatcher):
     while True:
         yield env.timeout(random.expovariate(1.0 / TASK_INTERVAL))
-        process_incoming_task(env, servers)
+        process_incoming_task(env, dispatcher)
 
-# --- Monitoring and Logging Functions ---
-def periodic_logger(env, servers, log_data, interval=1):
-    """Logs server and system metrics at regular intervals."""
-    while True:
-        yield env.timeout(interval)
-        for server in servers:
-            log_data.append({
-                'timestamp'  : env.now,
-                'server_id'  : server.name,
-                'is_active'  : server.is_active,
-                'cpu_used'   : server.cpu_used,
-                'q_len'      : server.q_len,
-                'network_in' : server.net_in,
-                'network_out': server.net_out,
-                'current_tasks': server.current_tasks
-            })
-        # Log active servers count
-        ACTIVE_SERVERS_HISTORY.append({
-            'timestamp': env.now,
-            'active_servers_count': sum(1 for s in servers if s.is_active)
-        })
-
-
-def monitor_system(env, servers):
-    """Monitors system load and scales servers up or down."""
-    global NUM_SERVERS # This will be the current number of active servers
+# --- TOC STEP 4: ELEVATE ---
+def monitor_system(env, servers, constraint_detector):
+    """Monitors the constraint and scales servers up or down."""
+    global NUM_SERVERS
 
     while True:
         yield env.timeout(SCALING_CHECK_INTERVAL)
-
-        active_servers = [s for s in servers if s.is_active]
-        if not active_servers:
-            # If no active servers, and we are below MIN_NUM_SERVERS, activate one
-            if NUM_SERVERS < MIN_NUM_SERVERS and len(servers) > NUM_SERVERS:
-                servers[NUM_SERVERS].is_active = True
-                NUM_SERVERS += 1
-                print(f"[{env.now:.2f}] Scaling up: Activated {servers[NUM_SERVERS-1].name}. Total active: {NUM_SERVERS}")
-            continue
-
-        total_q_len = sum(s.q_len for s in active_servers)
-        avg_q_utilization = (total_q_len / (len(active_servers) * MAX_QUEUE_LEN)) if (len(active_servers) * MAX_QUEUE_LEN) > 0 else 0
-
-        # Scale Up Logic
-        if avg_q_utilization > SCALE_UP_THRESHOLD and NUM_SERVERS < MAX_NUM_SERVERS:
-            # Find an inactive server to activate
+        
+        # Scale Up Logic: Based on the identified constraint's utilization
+        if constraint_detector.current_constraint['util'] > SCALE_UP_THRESHOLD and NUM_SERVERS < MAX_NUM_SERVERS:
             inactive_servers = [s for s in servers if not s.is_active]
             if inactive_servers:
-                server_to_activate = inactive_servers[0] # Just pick the first available
+                server_to_activate = inactive_servers[0]
                 server_to_activate.is_active = True
                 NUM_SERVERS += 1
-                print(f"[{env.now:.2f}] Scaling up: Activated {server_to_activate.name}. Total active: {NUM_SERVERS}")
-            else:
-                # This case means we hit MAX_NUM_SERVERS but the list 'servers' itself is not large enough
-                # In a real system, you'd provision more servers. For this simulation, we're capped.
-                pass # No more servers to activate
+                print(f"[{env.now:.2f}] ELEVATE: Constraint {constraint_detector.current_constraint['name']} at {(constraint_detector.current_constraint['util']*100):.1f}%. Scaling up. Active servers: {NUM_SERVERS}")
+        
+        # Scale Down Logic: Based on overall system idleness
+        else:
+            active_servers = [s for s in servers if s.is_active]
+            total_cpu = sum(s.cpu_used for s in active_servers)
+            total_cpu_capacity = len(active_servers) * CPU_CAPACITY
+            avg_sys_util = total_cpu / total_cpu_capacity if total_cpu_capacity > 0 else 0
 
-        # Scale Down Logic
-        elif avg_q_utilization < SCALE_DOWN_THRESHOLD and NUM_SERVERS > MIN_NUM_SERVERS:
-            # Find an active server that is idle or has very few tasks/queue
-            # Prioritize servers with no current tasks and empty queues
-            eligible_for_shutdown = [s for s in active_servers if s.current_tasks == 0 and s.q_len == 0]
-            if eligible_for_shutdown:
-                server_to_deactivate = eligible_for_shutdown[0] # Pick one to deactivate
-                server_to_deactivate.is_active = False
-                NUM_SERVERS -= 1
-                print(f"[{env.now:.2f}] Scaling down: Deactivated {server_to_deactivate.name}. Total active: {NUM_SERVERS}")
-            # If no idle server, don't scale down prematurely, wait for them to finish tasks.
+            if avg_sys_util < SCALE_DOWN_THRESHOLD and NUM_SERVERS > MIN_NUM_SERVERS:
+                # Find an idle server to shut down
+                eligible_for_shutdown = [s for s in active_servers if s.current_tasks == 0 and s.q_len == 0]
+                if eligible_for_shutdown:
+                    server_to_deactivate = eligible_for_shutdown[-1] # Pick last one
+                    server_to_deactivate.is_active = False
+                    NUM_SERVERS -= 1
+                    print(f"[{env.now:.2f}] DE-ELEVATE: Low system utilization ({(avg_sys_util*100):.1f}%). Scaling down. Active servers: {NUM_SERVERS}")
+
+# --- Logger and Main Simulation ---
+def periodic_logger(env, servers, log_data, constraint_detector):
+    while True:
+        yield env.timeout(1)
+        # Log active servers count
+        ACTIVE_SERVERS_HISTORY.append({
+            'timestamp': env.now,
+            'active_servers_count': sum(1 for s in servers if s.is_active),
+            'constraint': constraint_detector.current_constraint['name'],
+            'constraint_util': constraint_detector.current_constraint['util']
+        })
+        for server in servers:
+            log_data.append({
+                'timestamp': env.now, 'server_id': server.name, 'is_active': server.is_active,
+                'cpu_used': server.cpu_used, 'q_len': server.q_len,
+                'network_in': server.net_in, 'network_out': server.net_out,
+            })
 
 # --- Main Simulation Function ---
 def simulation():
-    global SLA_VIOLATIONS, TOTAL_TASKS, COMPLETED_TASKS, TASK_ID, TASK_TIMES, SLA_VIOLATIONS_PER_SERVER, ACTIVE_SERVERS_HISTORY, NUM_SERVERS
+    global SLA_VIOLATIONS, TOTAL_TASKS, COMPLETED_TASKS, TASK_ID, TASK_TIMES, ACTIVE_SERVERS_HISTORY, NUM_SERVERS
 
     print("Starting simulation...")
     print(f"Configuration: {CONFIG}")
     print(f"Initial Servers: {NUM_SERVERS}, Task Interval: {TASK_INTERVAL}, Max Queue: {MAX_QUEUE_LEN}")
     print(f"Server Capacity: CPU={CPU_CAPACITY}, NET={NET_CAPACITY}")
-    print(f"Lighter Tasks: {USE_LIGHTER_TASKS}")
-    print(f"Task Priority Range: 1 (highest) to {TASK_PRIORITY_RANGE} (lowest)")
-    print(f"Load Balancing Weights: Queue={LOAD_BALANCING_WEIGHTS['q_len']}, CPU={LOAD_BALANCING_WEIGHTS['cpu']}, Net={LOAD_BALANCING_WEIGHTS['net']}")
     if MAX_NUM_SERVERS > MIN_NUM_SERVERS:
         print(f"Dynamic Scaling: Min Servers={MIN_NUM_SERVERS}, Max Servers={MAX_NUM_SERVERS}")
         print(f"Scale Up Threshold (Avg Q Util): {SCALE_UP_THRESHOLD*100:.0f}%")
@@ -358,14 +373,12 @@ def simulation():
     COMPLETED_TASKS = 0
     TASK_ID = 0
     TASK_TIMES = {}
-    SLA_VIOLATIONS_PER_SERVER.clear()
     ACTIVE_SERVERS_HISTORY = []
     # Reset NUM_SERVERS to its initial value for the chosen CONFIG
     if CONFIG == "SCALABLE_BALANCED":
         NUM_SERVERS = 3 # Starting value for scalable config
     else:
         NUM_SERVERS = 6 if CONFIG == "BALANCED" else (8 if CONFIG == "HIGH_CAPACITY" else 4)
-
 
     random.seed(RANDOM_SEED) # Ensure reproducibility for each run
     env = simpy.Environment()
@@ -379,11 +392,15 @@ def simulation():
 
     log_data = [] # Data for server metrics logging
     
+    # --- TOC: Instantiate the new components ---
+    constraint_detector = ConstraintDetector(env, all_servers)
+    dispatcher = Dispatcher(env, all_servers, constraint_detector)
+    
     # Start simulation processes
-    env.process(generate_task(env, all_servers))
-    env.process(periodic_logger(env, all_servers, log_data))
+    env.process(generate_task(env, dispatcher))
+    env.process(periodic_logger(env, all_servers, log_data, constraint_detector))
     if MAX_NUM_SERVERS > MIN_NUM_SERVERS: # Only start monitor if scaling is enabled
-        env.process(monitor_system(env, all_servers))
+        env.process(monitor_system(env, all_servers, constraint_detector))
 
     # Run the simulation
     env.run(until=SIM_TIME)
@@ -435,7 +452,6 @@ def simulation():
     else:
         print("❌ POOR: Significant underperformance")
 
-    print(f"SLA Violations per Server: {dict(SLA_VIOLATIONS_PER_SERVER)}")
 
     # --- Tuning Recommendations ---
     if completion_rate_of_target < 90 or sla_rate > 5:
@@ -464,101 +480,50 @@ def simulation():
                 print("  → Increase NUM_SERVERS.")
 
     # --- Plotting Results ---
-    if not df_server_logs.empty:
-        plt.figure(figsize=(18, 12))
+    plt.figure(figsize=(16, 10))
+    plt.suptitle(f'TOC Simulation Results for {CONFIG}', fontsize=16)
 
-        # Plot 1: Queue Length Over Time
-        plt.subplot(3, 2, 1)
-        for server_id in df_server_logs['server_id'].unique():
-            server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-            plt.plot(server_data['timestamp'], server_data['q_len'], label=f'{server_id} (Active: {server_data["is_active"].iloc[-1]})', alpha=0.7)
-        plt.title('Queue Length Over Time per Server')
-        plt.xlabel('Time')
-        plt.ylabel('Queue Length')
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-        plt.grid(True)
+    # Plot 1: Active Servers and Constraint Utilization
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.plot(df_active_servers['timestamp'], df_active_servers['active_servers_count'], marker='.', linestyle='-', color='purple', label='Active Servers')
+    ax1.set_ylabel('Active Servers', color='purple'); ax1.tick_params(axis='y', labelcolor='purple')
+    ax1.set_yticks(range(MIN_NUM_SERVERS, MAX_NUM_SERVERS + 2)); ax1.grid(True)
+    
+    ax2 = ax1.twinx()
+    ax2.plot(df_active_servers['timestamp'], df_active_servers['constraint_util'], color='red', linestyle='--', label='Constraint Util')
+    ax2.set_ylabel('Constraint Utilization', color='red'); ax2.tick_params(axis='y', labelcolor='red')
+    ax2.set_ylim(0, 1.1)
+    ax1.set_title('Scaling vs. Constraint Utilization')
 
-        # Plot 2: CPU Usage Over Time
-        plt.subplot(3, 2, 2)
-        for server_id in df_server_logs['server_id'].unique():
-            server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-            plt.plot(server_data['timestamp'], server_data['cpu_used'], label=f'{server_id} (Active: {server_data["is_active"].iloc[-1]})', alpha=0.7)
-        plt.title('CPU Usage Over Time per Server')
-        plt.xlabel('Time')
-        plt.ylabel('CPU Used')
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-        plt.grid(True)
+    # Plot 2: DBR Buffer Sizes
+    plt.subplot(2, 2, 2)
+    for server_id in df_server_logs['server_id'].unique():
+        server_data = df_server_logs[df_server_logs['server_id'] == server_id]
+        if server_data['is_active'].any():
+            plt.plot(server_data['timestamp'], server_data['q_len'], label=f'{server_id}', alpha=0.7)
+    plt.title('DBR Buffer Sizes (Queue Length)'); plt.ylabel('Buffer Length')
+    plt.legend(loc='upper right'); plt.grid(True)
+    
+    # Plot 3: CPU Usage
+    plt.subplot(2, 2, 3)
+    for server_id in df_server_logs['server_id'].unique():
+        server_data = df_server_logs[df_server_logs['server_id'] == server_id]
+        if server_data['is_active'].any():
+            plt.plot(server_data['timestamp'], server_data['cpu_used'], label=f'{server_id}', alpha=0.7)
+    plt.title('CPU Usage per Server'); plt.ylabel('CPU Units'); plt.xlabel('Time')
+    plt.legend(loc='upper right'); plt.grid(True)
 
-        # Plot 3: Network Usage Over Time
-        plt.subplot(3, 2, 3)
-        for server_id in df_server_logs['server_id'].unique():
-            server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-            plt.plot(server_data['timestamp'], server_data['network_in'], label=f'{server_id} In', linestyle='-', alpha=0.7)
-            plt.plot(server_data['timestamp'], server_data['network_out'], label=f'{server_id} Out', linestyle='--', alpha=0.7)
-        plt.title('Network Usage Over Time per Server')
-        plt.xlabel('Time')
-        plt.ylabel('Network Usage')
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-        plt.grid(True)
-
-        # Plot 4: Task Completion Time Distribution
-        plt.subplot(3, 2, 4)
-        if turnaround_times:
-            plt.hist(turnaround_times, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-            plt.title('Task Turnaround Time Distribution')
-            plt.xlabel('Turnaround Time')
-            plt.ylabel('Frequency')
-            plt.grid(True)
-        else:
-            plt.text(0.5, 0.5, 'No tasks completed to plot turnaround time.', horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
-
-
-        # Plot 5: Active Servers Over Time
-        plt.subplot(3, 2, 5)
-        if not df_active_servers.empty:
-            plt.plot(df_active_servers['timestamp'], df_active_servers['active_servers_count'], marker='o', linestyle='-', color='purple')
-            plt.title('Number of Active Servers Over Time')
-            plt.xlabel('Time')
-            plt.ylabel('Active Servers')
-            plt.grid(True)
-            plt.yticks(range(MIN_NUM_SERVERS, MAX_NUM_SERVERS + 1)) # Ensure integer ticks
-        else:
-            plt.text(0.5, 0.5, 'No active server history to plot.', horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
-
-        # Plot 6: Overall System Utilization (CPU & Network)
-        plt.subplot(3, 2, 6)
-        if not active_server_logs.empty:
-            # Calculate total CPU/Net capacity of active servers at each timestamp
-            df_merged = df_server_logs.merge(df_active_servers, on='timestamp', how='left')
-            df_merged['total_cpu_capacity'] = df_merged['active_servers_count'] * CPU_CAPACITY
-            df_merged['total_net_capacity'] = df_merged['active_servers_count'] * NET_CAPACITY * 2 # In + Out
-
-            # Sum used resources across active servers
-            df_summed_usage = df_server_logs[df_server_logs['is_active'] == True].groupby('timestamp').agg(
-                total_cpu_used=('cpu_used', 'sum'),
-                total_net_used=('network_in', lambda x: x.sum() + df_server_logs.loc[x.index, 'network_out'].sum())
-            ).reset_index()
-
-            df_util = df_summed_usage.merge(df_merged[['timestamp', 'total_cpu_capacity', 'total_net_capacity']].drop_duplicates(), on='timestamp', how='left')
-
-            df_util['overall_cpu_util'] = (df_util['total_cpu_used'] / df_util['total_cpu_capacity']) * 100
-            df_util['overall_net_util'] = (df_util['total_net_used'] / df_util['total_net_capacity']) * 100
-            
-            plt.plot(df_util['timestamp'], df_util['overall_cpu_util'], label='Overall CPU Utilization', color='red')
-            plt.plot(df_util['timestamp'], df_util['overall_net_util'], label='Overall Network Utilization', color='blue', linestyle='--')
-            plt.title('Overall System Utilization')
-            plt.xlabel('Time')
-            plt.ylabel('Utilization (%)')
-            plt.ylim(0, 100)
-            plt.legend()
-            plt.grid(True)
-        else:
-            plt.text(0.5, 0.5, 'Not enough data to plot overall utilization.', horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
-
-
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap
-        plt.suptitle(f'Simulation Results for {CONFIG} Configuration', fontsize=16, y=0.98)
-        plt.show()
+    # Plot 4: Identified Constraint
+    plt.subplot(2, 2, 4)
+    unique_constraints = df_active_servers.dropna(subset=['constraint'])['constraint'].unique()
+    for constraint in unique_constraints:
+        subset = df_active_servers[df_active_servers['constraint'] == constraint]
+        plt.scatter(subset['timestamp'], subset['constraint'], label=constraint, s=10)
+    plt.title('System Constraint Over Time'); plt.ylabel('Constraint'); plt.xlabel('Time')
+    plt.xticks(rotation=15); plt.legend(loc='upper right'); plt.grid(True)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
 
 if __name__ == '__main__':
     simulation()
