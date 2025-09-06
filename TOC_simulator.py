@@ -15,7 +15,7 @@ EWMA_ALPHA = 0.2
 CONSTRAINT_CHECK_INTERVAL = 5 # How often to re-evaluate the system constraint
 
 # Configuration Profiles
-CONFIG = "SCALABLE_BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS", "SCALABLE_BALANCED"
+CONFIG = "BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS", "SCALABLE_BALANCED"
 
 if CONFIG == "BALANCED":
     RANDOM_SEED = 42
@@ -26,7 +26,6 @@ if CONFIG == "BALANCED":
     MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10 # Tasks will have priorities from 1 to this value (lower is higher priority)
-    LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2} # Weights for server fitness calculation
     # Dynamic Scaling (disabled for BALANCED profile)
     MIN_NUM_SERVERS = NUM_SERVERS
     MAX_NUM_SERVERS = NUM_SERVERS
@@ -43,7 +42,6 @@ elif CONFIG == "HIGH_CAPACITY":
     MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10
-    LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2}
     # Dynamic Scaling (disabled for HIGH_CAPACITY profile)
     MIN_NUM_SERVERS = NUM_SERVERS
     MAX_NUM_SERVERS = NUM_SERVERS
@@ -60,7 +58,6 @@ elif CONFIG == "LIGHT_TASKS":
     MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = True
     TASK_PRIORITY_RANGE = 10
-    LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2}
     # Dynamic Scaling (disabled for LIGHT_TASKS profile)
     MIN_NUM_SERVERS = NUM_SERVERS
     MAX_NUM_SERVERS = NUM_SERVERS
@@ -80,7 +77,7 @@ elif CONFIG == "SCALABLE_BALANCED":
     # Dynamic Scaling (enabled for SCALABLE_BALANCED profile)
     MIN_NUM_SERVERS = 2
     MAX_NUM_SERVERS = 10
-    SCALE_UP_THRESHOLD = 0.7 # If average queue utilization > 60%, scale up
+    SCALE_UP_THRESHOLD = 0.7 # If average queue utilization > 70%, scale up
     SCALE_DOWN_THRESHOLD = 0.4 # If average queue utilization < 20%, scale down
     SCALING_CHECK_INTERVAL = 15
 
