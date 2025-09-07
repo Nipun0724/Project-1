@@ -3,183 +3,120 @@ import random
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import deque
+from collections import defaultdict, deque
 import joblib
 from tensorflow import keras
 from keras.models import load_model
 
 # --- Global Configuration ---
 TARGET_COMPLETED_TASKS = 500
-SIM_TIME = 500 # Simulation duration in time units
-TASK_INTERVAL = 1.0 # Average time between task arrivals (exponential distribution)
+SIM_TIME = 500
+TASK_INTERVAL = 1.0
 WINDOW_SIZE = 20
 
-# Configuration Profiles
-CONFIG = "SCALABLE_BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS", "SCALABLE_BALANCED"
+CONFIG = "SCALABLE_BALANCED"
 
-if CONFIG == "BALANCED":
+if CONFIG == "SCALABLE_BALANCED":
     RANDOM_SEED = 42
     CPU_CAPACITY = 100
     NET_CAPACITY = 100
-    NUM_SERVERS = 6
-    MAX_QUEUE_LEN = 8
-    USE_LIGHTER_TASKS = False
-    TASK_PRIORITY_RANGE = 10 # Tasks will have priorities from 1 to this value (lower is higher priority)
-    LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2} # Weights for server fitness calculation
-    # Dynamic Scaling (disabled for BALANCED profile)
-    MIN_NUM_SERVERS = NUM_SERVERS
-    MAX_NUM_SERVERS = NUM_SERVERS
-    SCALE_UP_THRESHOLD = 0.7 # Average queue utilization threshold to scale up (0.0 to 1.0)
-    SCALE_DOWN_THRESHOLD = 0.3 # Average queue utilization threshold to scale down (0.0 to 1.0)
-    SCALING_CHECK_INTERVAL = 10 # How often to check for scaling opportunities
-
-elif CONFIG == "HIGH_CAPACITY":
-    RANDOM_SEED = 42
-    CPU_CAPACITY = 150
-    NET_CAPACITY = 150
-    NUM_SERVERS = 8
-    MAX_QUEUE_LEN = 5
-    USE_LIGHTER_TASKS = False
-    TASK_PRIORITY_RANGE = 10
-    LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2}
-    # Dynamic Scaling (disabled for HIGH_CAPACITY profile)
-    MIN_NUM_SERVERS = NUM_SERVERS
-    MAX_NUM_SERVERS = NUM_SERVERS
-    SCALE_UP_THRESHOLD = 0.7
-    SCALE_DOWN_THRESHOLD = 0.3
-    SCALING_CHECK_INTERVAL = 10
-
-elif CONFIG == "LIGHT_TASKS":
-    RANDOM_SEED = 42
-    CPU_CAPACITY = 100
-    NET_CAPACITY = 100
-    NUM_SERVERS = 4
-    MAX_QUEUE_LEN = 6
-    USE_LIGHTER_TASKS = True
-    TASK_PRIORITY_RANGE = 10
-    LOAD_BALANCING_WEIGHTS = {'q_len': 0.4, 'cpu': 0.4, 'net': 0.2}
-    # Dynamic Scaling (disabled for LIGHT_TASKS profile)
-    MIN_NUM_SERVERS = NUM_SERVERS
-    MAX_NUM_SERVERS = NUM_SERVERS
-    SCALE_UP_THRESHOLD = 0.7
-    SCALE_DOWN_THRESHOLD = 0.3
-    SCALING_CHECK_INTERVAL = 10
-
-elif CONFIG == "SCALABLE_BALANCED":
-    RANDOM_SEED = 42
-    CPU_CAPACITY = 100
-    NET_CAPACITY = 100
-    NUM_SERVERS = 3 # Starting number of servers
+    NUM_SERVERS = 3
     MAX_QUEUE_LEN = 5
     MAX_CENTRAL_BUFFER_LEN = 50
     USE_LIGHTER_TASKS = False
     TASK_PRIORITY_RANGE = 10
-    # Dynamic Scaling (enabled for SCALABLE_BALANCED profile)
+    
     MIN_NUM_SERVERS = 2
     MAX_NUM_SERVERS = 10
-    # --- FIX: Comment updated for clarity ---
-    SCALE_UP_PROBABILITY_THRESHOLD = 0.7 # If predicted bottleneck score > 70%, scale up
-    # --- FIX: Renamed for clarity and set to a more reasonable value ---
-    SCALE_DOWN_THRESHOLD = 0.4 # If average system CPU util < 40%, scale down
+    REACTIVE_SCALE_UP_THRESHOLD = 0.75
+    PREDICTIVE_SCALE_UP_THRESHOLD = 0.60
+    SCALE_DOWN_THRESHOLD = 0.40
     SCALING_CHECK_INTERVAL = 15
 
-
-# --- Global Simulation Metrics (will be reset for each simulation run) ---
-SLA_VIOLATIONS = 0
-TOTAL_TASKS = 0
-COMPLETED_TASKS = 0
-TASK_ID = 0 # Global task counter
-TASK_TIMES = {} # Stores arrival and completion times for each task
-ACTIVE_SERVERS_HISTORY = [] # To log the number of active servers over time
-
-# Set initial random seed for reproducibility
+# --- Global Metrics ---
+SLA_VIOLATIONS=0; TOTAL_TASKS=0; COMPLETED_TASKS=0; TASK_ID=0
+TASK_TIMES={}; ACTIVE_SERVERS_HISTORY=[]
 random.seed(RANDOM_SEED)
 
-# --- TOC STEP 1: IDENTIFY (AI INTEGRATION: AI-Powered Constraint Detector) ---
-class AiConstraintDetector:
-    """Uses a predictive model to identify the most likely future constraint."""
+# --- ### CRITICAL REFACTOR: On-Demand Scheduling Manager ---
+
+class SchedulingManager:
+    """
+    The new central brain. It is NOT a simpy process. It provides on-demand
+    constraint detection by switching between reactive and predictive modes.
+    """
     def __init__(self, env, all_servers, model, scaler):
         self.env = env
         self.all_servers = all_servers
         self.model = model
         self.scaler = scaler
-        self.current_constraint = {'name': 'None', 'score': 0.0}
-        
-        # Manages history buffers for all servers
+        self.warmup_period = WINDOW_SIZE
         self.history_buffers = {s.name: deque(maxlen=WINDOW_SIZE) for s in all_servers}
-        self.env.process(self.run())
 
     def update_history(self, server):
-        """Called by the logger to add the latest data."""
+        """Called by the logger to feed the latest data."""
         self.history_buffers[server.name].append([
             server.cpu_used, server.q_len, server.net_in, server.net_out
         ])
 
-    def run(self):
-        # Allow some time for buffers to fill initially
-        yield self.env.timeout(WINDOW_SIZE)
-        
-        while True:
-            yield self.env.timeout(5) # Re-evaluate predictions periodically
-            
-            input_data = []
-            candidate_servers = []
-            
-            active_servers = [s for s in self.all_servers if s.is_active]
-            for server in active_servers:
+    def get_current_constraint(self):
+        """
+        The core on-demand method. It is called by other processes to get
+        a real-time assessment of the system's constraint.
+        """
+        if self.env.now < self.warmup_period:
+            # --- REACTIVE MODE (During Warm-up) ---
+            max_util, constraint_name = -1.0, 'None (Reactive)'
+            for server in [s for s in self.all_servers if s.is_active]:
+                cpu_util = server.cpu_used / server.cpu_capacity
+                if cpu_util > max_util:
+                    max_util, constraint_name = cpu_util, f"{server.name} (Reactive)"
+            return {'name': constraint_name, 'score': 0.0, 'util': max_util}
+        else:
+            # --- PREDICTIVE MODE (AI-Driven) ---
+            input_data, candidate_servers = [], []
+            for server in [s for s in self.all_servers if s.is_active]:
                 if len(self.history_buffers[server.name]) == WINDOW_SIZE:
                     raw_data = np.array(self.history_buffers[server.name]).astype(np.float32)
                     normalized = self.scaler.transform(raw_data)
-                    input_data.append(normalized)
-                    candidate_servers.append(server)
+                    input_data.append(normalized); candidate_servers.append(server)
             
-            if not candidate_servers:
-                continue # Not enough data to make a prediction
+            if not candidate_servers: 
+                return {'name': 'Awaiting Data (Predicted)', 'score': 0.0, 'util': 0.0}
 
-            # Get bottleneck probability scores from the AI model
-            input_tensor = np.array(input_data)
-            pred_scores = self.model.predict(input_tensor, verbose=0).flatten()
-
-            # Find the server with the highest predicted score
-            max_score_index = np.argmax(pred_scores)
-            constraint_server = candidate_servers[max_score_index]
-            max_score = pred_scores[max_score_index]
+            pred_scores = self.model.predict(np.array(input_data), verbose=0).flatten()
+            max_idx = np.argmax(pred_scores)
             
-            self.current_constraint['name'] = f"{constraint_server.name} (Predicted)"
-            self.current_constraint['score'] = float(max_score)
+            return {
+                'name': f"{candidate_servers[max_idx].name} (Predicted)",
+                'score': float(pred_scores[max_idx]),
+                'util': 0.0 # Util is not relevant in predictive mode
+            }
 
-# --- TOC STEPS 2 & 3: EXPLOIT & SUBORDINATE ---
+# --- Dispatcher (Rope) ---
 class Dispatcher:
-    def __init__(self, env, all_servers, constraint_detector):
-        self.env = env
-        self.all_servers = all_servers
-        self.constraint_detector = constraint_detector
-        self.task_buffer = []
-        self.env.process(self.run())
-
+    def __init__(self, env, all_servers, manager):
+        self.env, self.all_servers, self.manager = env, all_servers, manager
+        self.task_buffer = []; self.env.process(self.run())
     def add_task(self, task):
-        self.task_buffer.append(task)
-        self.task_buffer.sort(key=lambda x: x[5])
-
+        self.task_buffer.append(task); self.task_buffer.sort(key=lambda x: x[5])
     def run(self):
         while True:
             if not self.task_buffer:
                 yield self.env.timeout(0.5); continue
-
-            # The name now includes "(Predicted)"
-            constraint_name_base = self.constraint_detector.current_constraint['name'].split(' ')[0:2]
-            constraint_server_name = " ".join(constraint_name_base)
-            constraint_server = next((s for s in self.all_servers if s.name == constraint_server_name), None)
+            
+            # --- REFACTOR: Get a fresh, on-demand constraint check ---
+            constraint = self.manager.get_current_constraint()
+            constraint_name = " ".join(constraint['name'].split(' ')[0:2])
+            constraint_server = next((s for s in self.all_servers if s.name == constraint_name), None)
             
             if constraint_server and constraint_server.q_len < MAX_QUEUE_LEN:
-                active_servers = [s for s in self.all_servers if s.is_active and s.q_len < MAX_QUEUE_LEN]
-                if active_servers:
-                    best_server = min(active_servers, key=lambda s: s.q_len)
-                    task_to_dispatch = self.task_buffer.pop(0)
-                    best_server.add_to_buffer(task_to_dispatch)
+                available = [s for s in self.all_servers if s.is_active and s.q_len < MAX_QUEUE_LEN]
+                if available:
+                    min(available, key=lambda s: s.q_len).add_to_buffer(self.task_buffer.pop(0))
             yield self.env.timeout(0.2)
 
-# --- Server Class ---
+# --- Server Class (Unchanged) ---
 class Server:
     def __init__(self, env, name):
         self.env, self.name = env, name
@@ -199,11 +136,9 @@ class Server:
                 if (cpu + self.cpu_used <= self.cpu_capacity and net_in + self.net_in <= self.net_capacity and net_out + self.net_out <= self.net_capacity):
                     task_idx = i; break
             if task_idx != -1:
-                task = self.queue_items.pop(task_idx)
-                cpu, net_in, net_out, duration, task_id, _ = task
-                self.cpu_used += cpu; self.net_in += net_in; self.net_out += net_out
-                self.current_tasks += 1
-                self.env.process(self.process_task(task_id, duration, cpu, net_in, net_out))
+                cpu, net_in, net_out, dur, task_id, _ = self.queue_items.pop(task_idx)
+                self.cpu_used += cpu; self.net_in += net_in; self.net_out += net_out; self.current_tasks += 1
+                self.env.process(self.process_task(task_id, dur, cpu, net_in, net_out))
             else: yield self.env.timeout(0.5)
     def process_task(self, task_id, duration, cpu, net_in, net_out):
         global COMPLETED_TASKS, TASK_TIMES
@@ -212,115 +147,88 @@ class Server:
         self.current_tasks -= 1; COMPLETED_TASKS += 1
         TASK_TIMES[task_id]['completion'] = self.env.now
 
-# --- Task Generation ---
+# --- Task Generation (Unchanged) ---
 def process_incoming_task(env, dispatcher):
     global TOTAL_TASKS, TASK_ID, TASK_TIMES, SLA_VIOLATIONS
     if len(dispatcher.task_buffer) >= MAX_CENTRAL_BUFFER_LEN:
         SLA_VIOLATIONS += 1; TOTAL_TASKS += 1; return
-    if USE_LIGHTER_TASKS:
-        cpu, net_in, net_out, dur = random.randint(8, 25), random.randint(1, 8), random.randint(1, 8), random.randint(2, 8)
-    else:
-        cpu, net_in, net_out, dur = random.randint(40, 90), random.randint(5, 15), random.randint(5, 15), random.randint(5, 15)
+    cpu, net_in, net_out, dur = (random.randint(8, 25), random.randint(1, 8), random.randint(1, 8), random.randint(2, 8)) if USE_LIGHTER_TASKS else (random.randint(40, 90), random.randint(5, 15), random.randint(5, 15), random.randint(5, 15))
     TASK_ID += 1; task_id = TASK_ID
     TASK_TIMES[task_id] = {'arrival': env.now, 'priority': random.randint(1, TASK_PRIORITY_RANGE)}
     task = (cpu, net_in, net_out, dur, task_id, TASK_TIMES[task_id]['priority'])
     dispatcher.add_task(task); TOTAL_TASKS += 1
-
 def generate_task(env, dispatcher):
     while True:
-        yield env.timeout(random.expovariate(1.0 / TASK_INTERVAL))
-        process_incoming_task(env, dispatcher)
+        yield env.timeout(random.expovariate(1.0 / TASK_INTERVAL)); process_incoming_task(env, dispatcher)
 
-# --- TOC STEP 4: ELEVATE (AI INTEGRATION: ELEVATE based on prediction score) ---
-def monitor_system(env, servers, constraint_detector):
+# --- ELEVATE Step (Refactored to use the manager) ---
+def monitor_system(env, servers, manager):
     global NUM_SERVERS
     while True:
         yield env.timeout(SCALING_CHECK_INTERVAL)
         
-        if constraint_detector.current_constraint['score'] > SCALE_UP_PROBABILITY_THRESHOLD and NUM_SERVERS < MAX_NUM_SERVERS:
-            inactive = [s for s in servers if not s.is_active]
-            if inactive:
-                inactive[0].is_active = True; NUM_SERVERS += 1
-                print(f"[{env.now:.2f}] ELEVATE: Predicted score {(constraint_detector.current_constraint['score']*100):.1f}%. Scaling up. Active: {NUM_SERVERS}")
-        # --- Prevent premature scale-down before AI is ready ---
-        elif env.now > WINDOW_SIZE:
+        # --- REFACTOR: Get a fresh, on-demand constraint check ---
+        constraint = manager.get_current_constraint()
+        
+        if env.now < manager.warmup_period:
+            if constraint['util'] > REACTIVE_SCALE_UP_THRESHOLD and NUM_SERVERS < MAX_NUM_SERVERS:
+                inactive = [s for s in servers if not s.is_active];
+                if inactive: inactive[0].is_active = True; NUM_SERVERS += 1; print(f"[{env.now:.2f}] ELEVATE (Reactive): Util {(constraint['util']*100):.1f}%. Scaling up. Active: {NUM_SERVERS}")
+        else:
+            if constraint['score'] > PREDICTIVE_SCALE_UP_THRESHOLD and NUM_SERVERS < MAX_NUM_SERVERS:
+                inactive = [s for s in servers if not s.is_active];
+                if inactive: inactive[0].is_active = True; NUM_SERVERS += 1; print(f"[{env.now:.2f}] ELEVATE (Predictive): Score {(constraint['score']*100):.1f}%. Scaling up. Active: {NUM_SERVERS}")
+
+        if env.now > manager.warmup_period:
             active = [s for s in servers if s.is_active]
             avg_util = sum(s.cpu_used for s in active) / (len(active) * CPU_CAPACITY) if active else 0
             if avg_util < SCALE_DOWN_THRESHOLD and NUM_SERVERS > MIN_NUM_SERVERS:
                 eligible = [s for s in active if s.current_tasks == 0 and s.q_len == 0]
                 if eligible:
-                    eligible[-1].is_active = False; NUM_SERVERS -= 1
-                    print(f"[{env.now:.2f}] DE-ELEVATE: Low util ({(avg_util*100):.1f}%). Scaling down. Active: {NUM_SERVERS}")
+                    eligible[-1].is_active = False; NUM_SERVERS -= 1; print(f"[{env.now:.2f}] DE-ELEVATE: Low util ({(avg_util*100):.1f}%). Scaling down. Active: {NUM_SERVERS}")
 
 # --- Logger ---
-def periodic_logger(env, servers, log_data, constraint_detector):
+def periodic_logger(env, servers, log_data, manager):
     while True:
         yield env.timeout(1)
+        # --- REFACTOR: Log the on-demand constraint info ---
+        constraint = manager.get_current_constraint()
         ACTIVE_SERVERS_HISTORY.append({'timestamp': env.now, 'active_servers_count': sum(1 for s in servers if s.is_active),
-                                     'constraint': constraint_detector.current_constraint['name'], 'constraint_score': constraint_detector.current_constraint['score']})
+                                     'constraint': constraint['name'], 'constraint_score': constraint['score']})
         for server in servers:
-            constraint_detector.update_history(server)
-            # --- FIX: Added missing network metrics for correct analysis ---
+            manager.update_history(server)
             log_data.append({'timestamp': env.now, 'server_id': server.name, 'is_active': server.is_active,
                              'cpu_used': server.cpu_used, 'q_len': server.q_len, 'network_in': server.net_in, 'network_out': server.net_out})
 
-# --- Main Simulation Function ---
+# --- Main Simulation ---
 def simulation():
-    global SLA_VIOLATIONS, TOTAL_TASKS, COMPLETED_TASKS, TASK_ID, TASK_TIMES, ACTIVE_SERVERS_HISTORY, NUM_SERVERS
+    global NUM_SERVERS, SLA_VIOLATIONS, TOTAL_TASKS, COMPLETED_TASKS, TASK_ID, TASK_TIMES, ACTIVE_SERVERS_HISTORY
+    try: model = load_model("bottleneck_predictor.keras"); scaler = joblib.load('minmax_scaler.save')
+    except Exception as e: print(f"ERROR: Could not load AI model. {e}"); return
 
-    try:
-        model = load_model("bottleneck_predictor.keras")
-        scaler = joblib.load('minmax_scaler.save')
-    except Exception as e:
-        print(f"ERROR: Could not load AI model or scaler. {e}")
-        return
-
-    # Reset global metrics for a new simulation run
-    SLA_VIOLATIONS = 0
-    TOTAL_TASKS = 0
-    COMPLETED_TASKS = 0
-    TASK_ID = 0
-    TASK_TIMES = {}
-    ACTIVE_SERVERS_HISTORY = []
+    SLA_VIOLATIONS=0; TOTAL_TASKS=0; COMPLETED_TASKS=0; TASK_ID=0
+    TASK_TIMES={}; ACTIVE_SERVERS_HISTORY=[]
+    if CONFIG == "SCALABLE_BALANCED": NUM_SERVERS = 3
     
-    # Reset NUM_SERVERS to its initial value for the chosen CONFIG
-    initial_num_servers = {
-        "BALANCED": 6,
-        "HIGH_CAPACITY": 8,
-        "LIGHT_TASKS": 4,
-        "SCALABLE_BALANCED": 3
-    }.get(CONFIG, 3)
-    NUM_SERVERS = initial_num_servers
-
-    print("Starting simulation...")
-    print(f"Configuration: {CONFIG}")
-    print(f"Initial Servers: {NUM_SERVERS}, Task Interval: {TASK_INTERVAL}, Max Queue: {MAX_QUEUE_LEN}")
-    print(f"Server Capacity: CPU={CPU_CAPACITY}, NET={NET_CAPACITY}")
-    if MAX_NUM_SERVERS > MIN_NUM_SERVERS:
-        print(f"Dynamic Scaling: Min Servers={MIN_NUM_SERVERS}, Max Servers={MAX_NUM_SERVERS}")
-    else:
-        print("Dynamic Scaling: Disabled (Fixed number of servers)")
-    print("="*60)
-
-    random.seed(RANDOM_SEED)
-    env = simpy.Environment()
-
+    random.seed(RANDOM_SEED); env = simpy.Environment()
     all_servers = [Server(env, f"Server {i+1}") for i in range(MAX_NUM_SERVERS)]
-    for i in range(NUM_SERVERS):
-        all_servers[i].is_active = True
-    for i in range(NUM_SERVERS, MAX_NUM_SERVERS):
-        all_servers[i].is_active = False
+    for i in range(NUM_SERVERS): all_servers[i].is_active = True
+    for i in range(NUM_SERVERS, MAX_NUM_SERVERS): all_servers[i].is_active = False
 
     log_data = []
+    # --- REFACTOR: Instantiate the new manager ---
+    manager = SchedulingManager(env, all_servers, model, scaler)
+    dispatcher = Dispatcher(env, all_servers, manager)
     
-    constraint_detector = AiConstraintDetector(env, all_servers, model, scaler)
-    dispatcher = Dispatcher(env, all_servers, constraint_detector)
-
     env.process(generate_task(env, dispatcher))
-    env.process(periodic_logger(env, all_servers, log_data, constraint_detector))
+    env.process(periodic_logger(env, all_servers, log_data, manager))
     if MAX_NUM_SERVERS > MIN_NUM_SERVERS:
-        env.process(monitor_system(env, all_servers, constraint_detector))
+        env.process(monitor_system(env, all_servers, manager))
 
+    print("--- Starting Final Hybrid AI+TOC Simulation ---")
+    print(f"Reactive Scale Up (first {WINDOW_SIZE}s): {REACTIVE_SCALE_UP_THRESHOLD*100:.0f}%")
+    print(f"Predictive Scale Up (AI-driven): {PREDICTIVE_SCALE_UP_THRESHOLD*100:.0f}%")
+    
     env.run(until=SIM_TIME)
 
     # --- Post-simulation Analysis and Results (Expanded Version) ---
