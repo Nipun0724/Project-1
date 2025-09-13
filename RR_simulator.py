@@ -12,6 +12,7 @@ TASK_INTERVAL = 1.0 # Average time between task arrivals (exponential distributi
 
 # Configuration Profiles
 CONFIG = "BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS"
+USE_CYCLICAL_LOAD = True
 
 if CONFIG == "BALANCED":
     RANDOM_SEED = 42
@@ -140,17 +141,29 @@ def process_incoming_task(env, servers):
     """Generates a new task and dispatches it to a server using round-robin."""
     global TOTAL_TASKS, SLA_VIOLATIONS, TASK_ID, TASK_TIMES, LAST_SERVER_INDEX
 
-    # Determine task demands based on configuration
-    if USE_LIGHTER_TASKS:
-        cpu_demand = random.randint(8, 25)
-        net_in_demand = random.randint(1, 8)
-        net_out_demand = random.randint(1, 8)
-        duration = random.randint(2, 8)
-    else:
-        cpu_demand = random.randint(40, 90)
-        net_in_demand = random.randint(5, 15)
-        net_out_demand = random.randint(5, 15)
+    if USE_CYCLICAL_LOAD:
+        # This logic mimics the sine-wave pattern from the training data script.
+        time_in_cycle = env.now % 100  # 100-second cycle
+        cpu_base = 70 + 40 * np.sin(2 * np.pi * time_in_cycle / 100)
+        net_base = 50 + 25 * np.sin(2 * np.pi * time_in_cycle / 100)
+        cpu_demand = int(np.clip(cpu_base + random.gauss(0, 10), 10, CPU_CAPACITY))
+        net_in_demand = int(np.clip(net_base + random.gauss(0, 5), 5, NET_CAPACITY))
+        net_out_demand = int(np.clip(net_base + random.gauss(0, 5), 5, NET_CAPACITY))
         duration = random.randint(5, 15)
+    elif USE_LIGHTER_TASKS:
+        cpu_demand, net_in_demand, net_out_demand, duration = (
+            random.randint(8, 25),
+            random.randint(1, 8),
+            random.randint(1, 8),
+            random.randint(2, 8),
+        )
+    else:  # Original random load
+        cpu_demand, net_in_demand, net_out_demand, duration = (
+            random.randint(40, 90),
+            random.randint(5, 15),
+            random.randint(5, 15),
+            random.randint(5, 15),
+        )
 
     TASK_ID += 1
     task_id = TASK_ID

@@ -92,8 +92,8 @@ elif CONFIG == "SCALABLE_BALANCED":
     # Dynamic Scaling (enabled for SCALABLE_BALANCED profile)
     MIN_NUM_SERVERS = 2
     MAX_NUM_SERVERS = 10
-    # If predicted bottleneck score > 70%, scale up
-    SCALE_UP_PROBABILITY_THRESHOLD = 0.7
+    # If predicted bottleneck score > 60%, scale up
+    SCALE_UP_PROBABILITY_THRESHOLD = 0.65
     # If average system CPU util < 40%, scale down
     SCALE_DOWN_THRESHOLD = 0.4
     SCALING_CHECK_INTERVAL = 15
@@ -337,8 +337,8 @@ def process_incoming_task(env, dispatcher):
     if USE_CYCLICAL_LOAD:
         # This logic mimics the sine-wave pattern from the training data script.
         time_in_cycle = env.now % 100  # 100-second cycle
-        cpu_base = 50 + 40 * np.sin(2 * np.pi * time_in_cycle / 100)
-        net_base = 30 + 25 * np.sin(2 * np.pi * time_in_cycle / 100)
+        cpu_base = 70 + 40 * np.sin(2 * np.pi * time_in_cycle / 100)
+        net_base = 50 + 25 * np.sin(2 * np.pi * time_in_cycle / 100)
         cpu = int(np.clip(cpu_base + random.gauss(0, 10), 10, CPU_CAPACITY))
         net_in = int(np.clip(net_base + random.gauss(0, 5), 5, NET_CAPACITY))
         net_out = int(np.clip(net_base + random.gauss(0, 5), 5, NET_CAPACITY))
@@ -398,8 +398,10 @@ def monitor_system(env, servers, constraint_detector):
         reactive_scale_up = False
         if constraint_server and constraint_server.is_active:
             # Use 85% as a critical "danger" threshold for immediate reaction.
-            current_constraint_util = (
-                constraint_server.cpu_used / constraint_server.cpu_capacity
+
+            current_constraint_util = max(
+                constraint_server.cpu_used / constraint_server.cpu_capacity,
+                (constraint_server.net_in + constraint_server.net_out) / (2 * constraint_server.net_capacity)
             )
             if current_constraint_util > 0.85:
                 reactive_scale_up = True
@@ -422,18 +424,27 @@ def monitor_system(env, servers, constraint_detector):
         # Scale-down logic remains the same, based on low overall utilization.
         elif env.now > WINDOW_SIZE:  # Don't scale down too early
             active = [s for s in servers if s.is_active]
-            avg_util = (
-                sum(s.cpu_used for s in active) / (len(active) * CPU_CAPACITY)
-                if active
-                else 0
-            )
+            if not active:
+                continue # No active servers to scale down
+
+            # --- FIX: Correct calculation for average network utilization ---
+            total_cpu_used = sum(s.cpu_used for s in active)
+            total_net_used = sum(s.net_in + s.net_out for s in active)
+
+            total_cpu_capacity = len(active) * CPU_CAPACITY
+            total_net_capacity = len(active) * NET_CAPACITY * 2 # In + Out
+
+            avg_cpu_util = total_cpu_used / total_cpu_capacity
+            avg_net_util = total_net_used / total_net_capacity
+            
+            # Using the max of the two is a good heuristic to decide if the system is idle
+            avg_util = max(avg_cpu_util, avg_net_util)
+
             if avg_util < SCALE_DOWN_THRESHOLD and NUM_SERVERS > MIN_NUM_SERVERS:
                 # Find an idle server to shut down
                 eligible = [s for s in active if s.current_tasks == 0 and s.q_len == 0]
                 if eligible:
-                    eligible[-1].is_active = (
-                        False  # Deactivate the last eligible server
-                    )
+                    eligible[-1].is_active = False  # Deactivate the last eligible server
                     NUM_SERVERS -= 1
                     print(
                         f"[{env.now:.2f}] DE-ELEVATE: Low util ({(avg_util*100):.1f}%). Scaling down. Active: {NUM_SERVERS}"
@@ -540,6 +551,7 @@ def simulation():
             if len(active_logs) > 0
             else 0
         )
+        avg_net_util = ((active_logs['network_in'] + active_logs['network_out']) / (2 * NET_CAPACITY)).mean() * 100 if not active_logs.empty else 0
     else:
         avg_q_len, avg_cpu_util = 0, 0
 
@@ -554,9 +566,12 @@ def simulation():
     print(
         f"Actual Completed Tasks: {COMPLETED_TASKS} ({completion_rate_of_target:.1f}% of target)"
     )
+    print(f"Total Tasks Generated: {TOTAL_TASKS}")
+    print(f"System Task Completion Rate: {(COMPLETED_TASKS/TOTAL_TASKS)*100:.1f}% (Completed vs. Generated)")
     print(f"SLA Violation Rate: {sla_rate:.2f}%")
     print(f"Average Queue Length (Active Servers): {avg_q_len:.2f}")
     print(f"Average CPU Utilization (Active Servers): {avg_cpu_util:.2f}%")
+    print(f"Average Network Utilization (Active Servers): {avg_net_util:.2f}%")
     print(f"Average Turnaround Time: {avg_turnaround:.2f}")
 
     if completion_rate_of_target >= 95:

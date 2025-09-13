@@ -38,7 +38,11 @@ while timestamp < SIM_TIME:
         # The new definition of a bottleneck.
         # A bottleneck is now defined as a server whose queue is ALMOST full.
         # This predicts the state that causes the dispatcher to stop.
-        bottleneck = int(q_len >= MAX_QUEUE_LEN - 1)
+        bottleneck = int(
+            cpu >= 0.8 * CPU_CAPACITY or
+            net_in >= 0.8 * NET_CAPACITY or
+            net_out >= 0.8 * NET_CAPACITY
+        )
 
         records.append({
             'timestamp': round(timestamp, 2), 'server_id': f'Server {s}',

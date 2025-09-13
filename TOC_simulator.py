@@ -13,9 +13,10 @@ TASK_INTERVAL = 1.0 # Average time between task arrivals (exponential distributi
 # EWMA (Exponentially Weighted Moving Average) alpha for smoothing utilization metrics
 EWMA_ALPHA = 0.2 
 CONSTRAINT_CHECK_INTERVAL = 5 # How often to re-evaluate the system constraint
+USE_CYCLICAL_LOAD = True
 
 # Configuration Profiles
-CONFIG = "BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS", "SCALABLE_BALANCED"
+CONFIG = "SCALABLE_BALANCED" # Options: "BALANCED", "HIGH_CAPACITY", "LIGHT_TASKS", "SCALABLE_BALANCED"
 
 if CONFIG == "BALANCED":
     RANDOM_SEED = 42
@@ -77,7 +78,7 @@ elif CONFIG == "SCALABLE_BALANCED":
     # Dynamic Scaling (enabled for SCALABLE_BALANCED profile)
     MIN_NUM_SERVERS = 2
     MAX_NUM_SERVERS = 10
-    SCALE_UP_THRESHOLD = 0.7 # If average queue utilization > 70%, scale up
+    SCALE_UP_THRESHOLD = 0.8 # If average queue utilization > 70%, scale up
     SCALE_DOWN_THRESHOLD = 0.4 # If average queue utilization < 20%, scale down
     SCALING_CHECK_INTERVAL = 15
 
@@ -272,11 +273,29 @@ def process_incoming_task(env, dispatcher):
         return
 
     # Task property generation
-    if USE_LIGHTER_TASKS:
-        cpu_demand, net_in_demand, net_out_demand, duration = random.randint(8, 25), random.randint(1, 8), random.randint(1, 8), random.randint(2, 8)
-    else:
-        cpu_demand, net_in_demand, net_out_demand, duration = random.randint(40, 90), random.randint(5, 15), random.randint(5, 15), random.randint(5, 15)
-
+    if USE_CYCLICAL_LOAD:
+        # This logic mimics the sine-wave pattern from the training data script.
+        time_in_cycle = env.now % 100  # 100-second cycle
+        cpu_base = 70 + 40 * np.sin(2 * np.pi * time_in_cycle / 100)
+        net_base = 50 + 25 * np.sin(2 * np.pi * time_in_cycle / 100)
+        cpu_demand = int(np.clip(cpu_base + random.gauss(0, 10), 10, CPU_CAPACITY))
+        net_in_demand = int(np.clip(net_base + random.gauss(0, 5), 5, NET_CAPACITY))
+        net_out_demand = int(np.clip(net_base + random.gauss(0, 5), 5, NET_CAPACITY))
+        duration = random.randint(5, 15)
+    elif USE_LIGHTER_TASKS:
+        cpu_demand, net_in_demand, net_out_demand, duration = (
+            random.randint(8, 25),
+            random.randint(1, 8),
+            random.randint(1, 8),
+            random.randint(2, 8),
+        )
+    else:  # Original random load
+        cpu_demand, net_in_demand, net_out_demand, duration = (
+            random.randint(40, 90),
+            random.randint(5, 15),
+            random.randint(5, 15),
+            random.randint(5, 15),
+        )
     TASK_ID += 1
     task_id = TASK_ID
     arrival_time = env.now
@@ -476,51 +495,85 @@ def simulation():
             else:
                 print("  → Increase NUM_SERVERS.")
 
-    # --- Plotting Results ---
-    plt.figure(figsize=(16, 10))
-    plt.suptitle(f'TOC Simulation Results for {CONFIG}', fontsize=16)
+    # --- Plotting Results (Corrected and Expanded) ---
+    if not df_server_logs.empty:
+        plt.figure(figsize=(18, 12)) # Increased size for a 3x2 grid
+        plt.suptitle(f'TOC Simulation Results for {CONFIG}', fontsize=16)
 
-    # Plot 1: Active Servers and Constraint Utilization
-    ax1 = plt.subplot(2, 2, 1)
-    ax1.plot(df_active_servers['timestamp'], df_active_servers['active_servers_count'], marker='.', linestyle='-', color='purple', label='Active Servers')
-    ax1.set_ylabel('Active Servers', color='purple'); ax1.tick_params(axis='y', labelcolor='purple')
-    ax1.set_yticks(range(MIN_NUM_SERVERS, MAX_NUM_SERVERS + 2)); ax1.grid(True)
-    
-    ax2 = ax1.twinx()
-    ax2.plot(df_active_servers['timestamp'], df_active_servers['constraint_util'], color='red', linestyle='--', label='Constraint Util')
-    ax2.set_ylabel('Constraint Utilization', color='red'); ax2.tick_params(axis='y', labelcolor='red')
-    ax2.set_ylim(0, 1.1)
-    ax1.set_title('Scaling vs. Constraint Utilization')
+        # Plot 1: Active Servers and Constraint Utilization
+        ax1 = plt.subplot(3, 2, 1)
+        ax1.plot(df_active_servers['timestamp'], df_active_servers['active_servers_count'], marker='.', linestyle='-', color='purple', label='Active Servers')
+        ax1.set_ylabel('Active Servers', color='purple'); ax1.tick_params(axis='y', labelcolor='purple')
+        ax1.set_yticks(range(MIN_NUM_SERVERS, MAX_NUM_SERVERS + 2)); ax1.grid(True)
+        
+        ax2 = ax1.twinx()
+        ax2.plot(df_active_servers['timestamp'], df_active_servers['constraint_util'], color='red', linestyle='--', label='Constraint Util')
+        ax2.set_ylabel('Constraint Utilization', color='red'); ax2.tick_params(axis='y', labelcolor='red')
+        ax2.set_ylim(0, 1.1)
+        ax1.set_title('Scaling vs. Constraint Utilization')
+        ax1.legend(loc='upper left'); ax2.legend(loc='lower right')
 
-    # Plot 2: DBR Buffer Sizes
-    plt.subplot(2, 2, 2)
-    for server_id in df_server_logs['server_id'].unique():
-        server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-        if server_data['is_active'].any():
-            plt.plot(server_data['timestamp'], server_data['q_len'], label=f'{server_id}', alpha=0.7)
-    plt.title('DBR Buffer Sizes (Queue Length)'); plt.ylabel('Buffer Length')
-    plt.legend(loc='upper right'); plt.grid(True)
-    
-    # Plot 3: CPU Usage
-    plt.subplot(2, 2, 3)
-    for server_id in df_server_logs['server_id'].unique():
-        server_data = df_server_logs[df_server_logs['server_id'] == server_id]
-        if server_data['is_active'].any():
-            plt.plot(server_data['timestamp'], server_data['cpu_used'], label=f'{server_id}', alpha=0.7)
-    plt.title('CPU Usage per Server'); plt.ylabel('CPU Units'); plt.xlabel('Time')
-    plt.legend(loc='upper right'); plt.grid(True)
+        # Plot 2: DBR Buffer Sizes (Queue Length)
+        plt.subplot(3, 2, 2)
+        for server_id in df_server_logs['server_id'].unique():
+            server_data = df_server_logs[df_server_logs['server_id'] == server_id]
+            if server_data['is_active'].any():
+                plt.plot(server_data['timestamp'], server_data['q_len'], label=f'{server_id}', alpha=0.7)
+        plt.title('DBR Buffer Sizes (Queue Length)'); plt.ylabel('Buffer Length')
+        plt.legend(loc='best'); plt.grid(True)
+        
+        # Plot 3: Identified System Constraint
+        plt.subplot(3, 2, 3)
+        unique_constraints = df_active_servers.dropna(subset=['constraint'])['constraint'].unique()
+        for constraint in unique_constraints:
+            subset = df_active_servers[df_active_servers['constraint'] == constraint]
+            plt.scatter(subset['timestamp'], subset['constraint'], label=constraint, s=10)
+        plt.title('System Constraint Over Time'); plt.ylabel('Constraint')
+        plt.xticks(rotation=15); plt.legend(loc='best'); plt.grid(True)
 
-    # Plot 4: Identified Constraint
-    plt.subplot(2, 2, 4)
-    unique_constraints = df_active_servers.dropna(subset=['constraint'])['constraint'].unique()
-    for constraint in unique_constraints:
-        subset = df_active_servers[df_active_servers['constraint'] == constraint]
-        plt.scatter(subset['timestamp'], subset['constraint'], label=constraint, s=10)
-    plt.title('System Constraint Over Time'); plt.ylabel('Constraint'); plt.xlabel('Time')
-    plt.xticks(rotation=15); plt.legend(loc='upper right'); plt.grid(True)
-    
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show()
+        # Plot 4: Task Turnaround Time Distribution
+        plt.subplot(3, 2, 4)
+        if turnaround_times:
+            plt.hist(turnaround_times, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
+            plt.title('Task Turnaround Time Distribution'); plt.xlabel('Time')
+            plt.ylabel('Frequency'); plt.grid(True)
+        else:
+            plt.text(0.5, 0.5, 'No tasks completed.', ha='center', va='center')
+
+        # Plot 5: CPU Usage Per Server
+        plt.subplot(3, 2, 5)
+        for server_id in df_server_logs['server_id'].unique():
+            server_data = df_server_logs[df_server_logs['server_id'] == server_id]
+            if server_data['is_active'].any():
+                plt.plot(server_data['timestamp'], server_data['cpu_used'], label=f'{server_id}', alpha=0.7)
+        plt.title('CPU Usage per Server'); plt.ylabel('CPU Units'); plt.xlabel('Time')
+        plt.legend(loc='best'); plt.grid(True)
+
+        # Plot 6: Overall System Utilization (CPU & Network)
+        plt.subplot(3, 2, 6)
+        if not df_active_servers.empty:
+            df_merged = df_server_logs.merge(df_active_servers, on='timestamp', how='left').ffill()
+            df_merged['total_cpu_capacity'] = df_merged['active_servers_count'] * CPU_CAPACITY
+            df_merged['total_net_capacity'] = df_merged['active_servers_count'] * NET_CAPACITY * 2
+            
+            df_summed = df_server_logs[df_server_logs['is_active']].groupby('timestamp').agg(
+                total_cpu=('cpu_used', 'sum'),
+                total_net=('network_in', lambda x: x.sum() + df_server_logs.loc[x.index, 'network_out'].sum())
+            ).reset_index()
+            
+            df_util = df_summed.merge(df_merged[['timestamp', 'total_cpu_capacity', 'total_net_capacity']].drop_duplicates(), on='timestamp', how='left')
+            
+            df_util['overall_cpu_util'] = (df_util['total_cpu'] / df_util['total_cpu_capacity']) * 100
+            df_util['overall_net_util'] = (df_util['total_net'] / df_util['total_net_capacity']) * 100
+            
+            plt.plot(df_util['timestamp'], df_util['overall_cpu_util'], label='Overall CPU Usage', color='red')
+            plt.plot(df_util['timestamp'], df_util['overall_net_util'], label='Overall Network Usage', color='blue', linestyle='--')
+            
+            plt.title('Overall System Utilization'); plt.xlabel('Time'); plt.ylabel('Utilization (%)')
+            plt.ylim(0, 100); plt.legend(); plt.grid(True)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
 
 if __name__ == '__main__':
     simulation()
